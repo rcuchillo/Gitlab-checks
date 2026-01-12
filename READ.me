@@ -1,0 +1,12 @@
+export GITLAB_URL="https://gitlab.yourcompany.com"
+export GITLAB_TOKEN="YOUR_PRIVATE_TOKEN"
+
+
+python gitlab_mlops_metrics.py \
+  --group "your-group/path" \
+  --since "2025-10-01T00:00:00Z" \
+  --until "2026-01-01T00:00:00Z" \
+  --outdir "./out" \
+  --recursive-repo-scan
+
+  
