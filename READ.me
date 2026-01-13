@@ -1,4 +1,4 @@
-export GITLAB_URL="https://gitlab.yourcompany.com"
+9export GITLAB_URL="https://gitlab.yourcompany.com"
 export GITLAB_TOKEN="YOUR_PRIVATE_TOKEN"
 
 
@@ -33,4 +33,15 @@ python gitlab_mlops_adoption.py \
   --until "2026-12-31T23:59:59Z" \
   --outdir "./out" \
   --forge-prefixes "function_forge" \
+  --log-level INFO
+
+gitlab-tracker
+
+export GITLAB_TOKEN="..."
+python gitlab_mlops_adoption.py \
+  --base-url https://gitlab.example.com \
+  --token "$GITLAB_TOKEN" \
+  --group-id 12345 \
+  --function-forge-names function_forge,function-forge \
+  --outdir ./out \
   --log-level INFO
