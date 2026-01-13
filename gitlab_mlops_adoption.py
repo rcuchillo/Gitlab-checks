@@ -116,7 +116,7 @@ class GL:
         )
 
     def mrs_updated_after(self, project, since: datetime) -> List[Any]:
-        # We bucket ourselves by created_at / merged_at
+        # We bucket ourselves by created_at / merged_at / closed_at
         try:
             return project.mergerequests.list(
                 state="all",
@@ -202,15 +202,16 @@ IMPORT_LINE_RE = re.compile(r"^\s*(from\s+([A-Za-z_]\w*)\b|import\s+([A-Za-z_]\w
 
 @dataclass
 class SnapshotStats:
-    has_ci_config: bool = False
-    has_configs: bool = False
-    has_docs: bool = False
-    has_notebooks_dir: bool = False
-    has_src: bool = False
-    has_tests: bool = False
-    has_tests_integration: bool = False
-    has_scripts_dir: bool = False
-    has_requirements_file: bool = False
+    # 0/1 ints (as requested)
+    has_ci_config: int = 0
+    has_configs: int = 0
+    has_docs: int = 0
+    has_notebooks_dir: int = 0
+    has_src: int = 0
+    has_tests: int = 0
+    has_tests_integration: int = 0
+    has_scripts_dir: int = 0
+    has_requirements_file: int = 0
 
     notebooks_count: int = 0
     scripts_count: int = 0  # scripts/*.py
@@ -284,25 +285,25 @@ def scan_snapshot(tar_bytes: bytes, forge_prefixes: List[str]) -> SnapshotStats:
             norm = name.split("/", 1)[1] if "/" in name else name
 
             if norm == CI_FILE:
-                st.has_ci_config = True
+                st.has_ci_config = 1
 
             if norm.startswith("configs/"):
-                st.has_configs = True
+                st.has_configs = 1
             if norm.startswith("docs/"):
-                st.has_docs = True
+                st.has_docs = 1
             if norm.startswith("notebooks/"):
-                st.has_notebooks_dir = True
+                st.has_notebooks_dir = 1
             if norm.startswith("src/"):
-                st.has_src = True
+                st.has_src = 1
             if norm.startswith("tests/"):
-                st.has_tests = True
+                st.has_tests = 1
             if norm.startswith("tests_integration/"):
-                st.has_tests_integration = True
+                st.has_tests_integration = 1
             if norm.startswith("scripts/"):
-                st.has_scripts_dir = True
+                st.has_scripts_dir = 1
 
             if any(norm == rf for rf in REQ_FILES):
-                st.has_requirements_file = True
+                st.has_requirements_file = 1
 
             if norm.endswith(".ipynb"):
                 st.notebooks_count += 1
@@ -475,7 +476,6 @@ def compute_diff_contrib(changes_payload: Dict[str, Any], forge_prefixes: List[s
             acc.forge_files_hit += 1
 
         if is_test:
-            # proxy: nonblank added lines in test files
             nonblank = sum(1 for ln in added_lines if ln.strip())
             acc.test_lines_added += nonblank
 
@@ -498,7 +498,6 @@ def pipeline_bucket_status(status: Optional[str]) -> str:
         return "failed"
     if status == "canceled":
         return "canceled"
-    # treat everything else as "other" (running, pending, skipped, etc.)
     return "other"
 
 
@@ -515,14 +514,12 @@ def main() -> int:
     ap.add_argument("--forge-prefixes", default="function_forge",
                     help="Comma-separated top-level import names for Function Forge (default: function_forge)")
     ap.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
-    ap.add_argument("--max-projects", type=int, default=10_000,
-                    help="Safety limit on number of projects processed")
+    ap.add_argument("--max-projects", type=int, default=10_000, help="Safety limit on number of projects processed")
     ap.add_argument("--max-mrs-per-project", type=int, default=50_000,
                     help="Safety limit on MRs pulled per project (updated_after filter still applies)")
     args = ap.parse_args()
 
-    logging.basicConfig(level=getattr(logging, args.log_level),
-                        format="%(asctime)s %(levelname)s %(message)s")
+    logging.basicConfig(level=getattr(logging, args.log_level), format="%(asctime)s %(levelname)s %(message)s")
 
     url = os.getenv("GITLAB_URL")
     token = os.getenv("GITLAB_TOKEN")
@@ -559,16 +556,17 @@ def main() -> int:
                 "project": getattr(p, "path_with_namespace", ""),
                 "default_branch": getattr(p, "default_branch", "") or "main",
 
-                # snapshot structure
-                "has_ci_config": None,
-                "has_configs": None,
-                "has_docs": None,
-                "has_notebooks_dir": None,
-                "has_src": None,
-                "has_tests": None,
-                "has_tests_integration": None,
-                "has_scripts_dir": None,
-                "has_requirements_file": None,
+                # snapshot structure (0/1) + success flag
+                "snapshot_ok": 0,
+                "has_ci_config": 0,
+                "has_configs": 0,
+                "has_docs": 0,
+                "has_notebooks_dir": 0,
+                "has_src": 0,
+                "has_tests": 0,
+                "has_tests_integration": 0,
+                "has_scripts_dir": 0,
+                "has_requirements_file": 0,
 
                 # snapshot content metrics
                 "functions_total": None,
@@ -583,6 +581,11 @@ def main() -> int:
                 "mrs_created": 0,
                 "mrs_merged": 0,
                 "mr_notes_total": 0,
+
+                # NEW: MR close metrics
+                "mrs_closed": 0,
+                "mr_time_to_close_hours_median": None,
+                "mr_time_to_close_hours_mean": None,
 
                 # CI usage: default branch pipelines
                 "default_branch_pipelines_total": 0,
@@ -634,6 +637,11 @@ def main() -> int:
                 "mr_notes_written": 0,   # strict: MR notes authored
                 "comment_events": 0,     # broad: events action=commented
 
+                # NEW: MR close metrics (user)
+                "mrs_closed": 0,
+                "mr_time_to_close_hours_median": None,
+                "mr_time_to_close_hours_mean": None,
+
                 # MR diff contributions (for merged MRs)
                 "mr_added_docstring_lines": 0,
                 "mr_test_files_touched": 0,
@@ -658,6 +666,10 @@ def main() -> int:
 
     diff_acc_proj: Dict[Tuple[int, str], DiffContribAcc] = {}
     diff_acc_user: Dict[Tuple[int, str], DiffContribAcc] = {}
+
+    # NEW: MR close time accumulators
+    close_times_proj: Dict[Tuple[int, str], List[float]] = {}
+    close_times_user: Dict[Tuple[int, str], List[float]] = {}
 
     # ----------------------------
     # User events volumes
@@ -687,13 +699,12 @@ def main() -> int:
                 user_rows[(uid, mk)]["comment_events"] += 1
 
     # ----------------------------
-    # Per-project: MRs, notes, MR diffs + MR pipeline CI attribution
+    # Per-project: MRs, notes, MR close time, MR diffs + MR pipeline CI attribution
     # ----------------------------
-    LOG.info("Collecting MR volumes, notes, MR diff contributions, and MR pipeline CI attribution...")
+    LOG.info("Collecting MR volumes, notes, close time, MR diff contributions, and MR pipeline CI attribution...")
     for idx, project in enumerate(projects, start=1):
         pid = project.id
         pname = getattr(project, "path_with_namespace", str(pid))
-        default_branch = getattr(project, "default_branch", "") or "main"
         LOG.info("[%d/%d] Project %s", idx, len(projects), pname)
 
         mrs = gl.mrs_updated_after(project, since)[: args.max_mrs_per_project]
@@ -707,7 +718,9 @@ def main() -> int:
 
             created_at = parse_dt(getattr(mr, "created_at", None))
             merged_at = parse_dt(getattr(mr, "merged_at", None))
+            closed_at = parse_dt(getattr(mr, "closed_at", None))
 
+            # MR created volume
             if created_at:
                 mk = month_key(created_at)
                 if (pid, mk) in project_rows:
@@ -715,6 +728,7 @@ def main() -> int:
                 if author_id and (author_id, mk) in user_rows:
                     user_rows[(author_id, mk)]["mrs_created"] += 1
 
+            # MR merged volume
             merged_month = None
             if state == "merged" and merged_at:
                 mk = month_key(merged_at)
@@ -723,6 +737,23 @@ def main() -> int:
                 if author_id and (author_id, mk) in user_rows:
                     user_rows[(author_id, mk)]["mrs_merged"] += 1
                 merged_month = mk
+
+            # NEW: time to close (merged or closed), bucket by close timestamp month
+            close_ts = None
+            if state == "merged" and merged_at:
+                close_ts = merged_at
+            elif state == "closed" and closed_at:
+                close_ts = closed_at
+
+            if created_at and close_ts:
+                mk = month_key(close_ts)
+                hrs = (close_ts - created_at).total_seconds() / 3600.0
+                if (pid, mk) in project_rows:
+                    project_rows[(pid, mk)]["mrs_closed"] += 1
+                    close_times_proj.setdefault((pid, mk), []).append(hrs)
+                if author_id and (author_id, mk) in user_rows:
+                    user_rows[(author_id, mk)]["mrs_closed"] += 1
+                    close_times_user.setdefault((author_id, mk), []).append(hrs)
 
             # Notes volume (bucket by note timestamp)
             notes = gl.mr_notes(mr)
@@ -740,7 +771,7 @@ def main() -> int:
                 if na and (na, mk) in user_rows:
                     user_rows[(na, mk)]["mr_notes_written"] += 1
 
-            # MR diff contributions + MR pipeline CI (only for merged MRs in window, attributed to merge month)
+            # MR diff contributions + MR pipeline CI (only for merged MRs, attributed to merge month)
             if merged_month and author_id and (pid, merged_month) in project_rows and (author_id, merged_month) in user_rows:
                 # 1) MR diff contributions
                 changes = gl.mr_changes(pid, mr_iid)
@@ -764,7 +795,6 @@ def main() -> int:
                 # 2) MR pipeline CI attribution (latest MR pipeline)
                 mr_pipes = gl.mr_pipelines(pid, mr_iid)
                 if mr_pipes:
-                    # choose latest by created_at
                     mr_pipes_sorted = sorted(
                         mr_pipes,
                         key=lambda x: parse_dt(x.get("created_at")) or datetime.min.replace(tzinfo=timezone.utc),
@@ -797,6 +827,16 @@ def main() -> int:
                             except Exception:
                                 pass
 
+    # Finalize MR close time mean/median
+    LOG.info("Finalizing MR close-time metrics...")
+    for (pid, mk), vals in close_times_proj.items():
+        project_rows[(pid, mk)]["mr_time_to_close_hours_median"] = safe_median(vals)
+        project_rows[(pid, mk)]["mr_time_to_close_hours_mean"] = safe_mean(vals)
+
+    for (uid, mk), vals in close_times_user.items():
+        user_rows[(uid, mk)]["mr_time_to_close_hours_median"] = safe_median(vals)
+        user_rows[(uid, mk)]["mr_time_to_close_hours_mean"] = safe_mean(vals)
+
     # Write diff aggregates + MR pipeline stats into rows
     LOG.info("Finalizing diff-based contribution metrics and MR pipeline CI stats...")
     for (pid, mk), acc in diff_acc_proj.items():
@@ -809,7 +849,6 @@ def main() -> int:
         row["mr_notebooks_net_files"] = acc.notebooks_added_files - acc.notebooks_deleted_files
         row["mr_forge_reuse_score"] = diff_forge_reuse_score(acc)
 
-        # MR pipeline CI stats
         row["mr_pipelines_total"] = acc.mr_pipelines_total
         row["mr_pipelines_success"] = acc.mr_pipelines_success
         row["mr_pipelines_failed"] = acc.mr_pipelines_failed
@@ -912,6 +951,7 @@ def main() -> int:
                 st = scan_snapshot(tar_bytes, forge_prefixes)
 
                 row = project_rows[(pid, mk)]
+                row["snapshot_ok"] = 1  # success
                 row["has_ci_config"] = st.has_ci_config
                 row["has_configs"] = st.has_configs
                 row["has_docs"] = st.has_docs
@@ -931,6 +971,7 @@ def main() -> int:
                 row["notebook_ratio"] = st.notebook_ratio
 
             except Exception as e:
+                # keep 0/1 folder flags at their default 0, but mark snapshot_ok=0 (already)
                 LOG.warning("  Snapshot failed for %s %s: %s", pname, mk, str(e))
 
     # ----------------------------
@@ -940,32 +981,35 @@ def main() -> int:
     df_proj = pd.DataFrame(list(project_rows.values()))
     df_user = pd.DataFrame(list(user_rows.values()))
 
-    bool_cols = [
+    # Folder flags are already 0/1; workspace % = mean * 100
+    folder_cols = [
         "has_ci_config", "has_configs", "has_docs", "has_notebooks_dir", "has_src", "has_tests",
         "has_tests_integration", "has_scripts_dir", "has_requirements_file",
     ]
 
-    # cast booleans to floats for mean
-    for c in bool_cols:
-        df_proj[c] = df_proj[c].astype("float")  # True->1.0 False->0.0 None->nan
-
-    # Weighted workspace pipeline success rate = total_success / total_total
     workspace = df_proj.groupby("month", as_index=False).agg({
         "project_id": "count",
+        "snapshot_ok": "sum",
         "docstring_coverage_pct": "mean",
         "forge_import_symbols_pct": "mean",
         "notebooks_count": "sum",
         "scripts_count": "sum",
+        "notebook_ratio": "mean",  # mean of project ratios
+
         "mrs_created": "sum",
         "mrs_merged": "sum",
         "mr_notes_total": "sum",
+
+        "mrs_closed": "sum",
+        "mr_time_to_close_hours_median": "mean",  # mean of medians across projects
+        "mr_time_to_close_hours_mean": "mean",
 
         # default branch pipelines totals
         "default_branch_pipelines_total": "sum",
         "default_branch_pipelines_success": "sum",
         "default_branch_pipelines_failed": "sum",
         "default_branch_pipelines_canceled": "sum",
-        "default_branch_pipeline_duration_median_seconds": "mean",  # mean of medians across projects
+        "default_branch_pipeline_duration_median_seconds": "mean",
         "default_branch_pipeline_duration_mean_seconds": "mean",
         "default_branch_pipeline_coverage_median": "mean",
         "default_branch_pipeline_coverage_mean": "mean",
@@ -988,40 +1032,37 @@ def main() -> int:
         "mr_notebooks_net_files": "sum",
     }).rename(columns={"project_id": "projects_count"})
 
-    # workspace notebook ratio
+    # workspace notebook ratio across totals
     def _ws_ratio(row):
         denom = (row["notebooks_count"] + row["scripts_count"])
         return (row["notebooks_count"] / denom) if denom and denom > 0 else None
 
     workspace["workspace_notebook_ratio"] = workspace.apply(_ws_ratio, axis=1)
 
-    # workspace default branch success rate (weighted)
+    # Weighted workspace pipeline success rate
     workspace["workspace_default_branch_pipeline_success_rate"] = workspace.apply(
         lambda r: (r["default_branch_pipelines_success"] / r["default_branch_pipelines_total"])
         if r["default_branch_pipelines_total"] else None,
         axis=1,
     )
-
-    # workspace MR pipeline success rate (weighted)
     workspace["workspace_mr_pipeline_success_rate"] = workspace.apply(
         lambda r: (r["mr_pipelines_success"] / r["mr_pipelines_total"])
         if r["mr_pipelines_total"] else None,
         axis=1,
     )
-
-    # workspace MR pipeline adoption rate
     workspace["workspace_mr_pipeline_adoption_rate"] = workspace.apply(
         lambda r: (r["mrs_merged_with_mr_pipeline"] / r["mrs_merged"])
         if r["mrs_merged"] else None,
         axis=1,
     )
 
-    # pct of projects with each structure item
-    for c in bool_cols:
+    # Folder adoption percentages (only meaningful where snapshot_ok>0)
+    # If you want to exclude failed snapshots from % calculations, filter df_proj[df_proj.snapshot_ok==1] here.
+    for c in folder_cols:
         workspace[f"pct_projects_{c}"] = 100.0 * df_proj.groupby("month")[c].mean().values
 
     # ----------------------------
-    # Write CSVs
+    # Write CSVs (folder flags remain 0/1)
     # ----------------------------
     os.makedirs(args.outdir, exist_ok=True)
 
@@ -1030,10 +1071,6 @@ def main() -> int:
     ws_path = os.path.join(args.outdir, "workspace_monthly.csv")
 
     df_proj_out = df_proj.sort_values(["month", "project"]).copy()
-    # restore booleans nicely
-    for c in bool_cols:
-        df_proj_out[c] = df_proj_out[c].map(lambda x: None if pd.isna(x) else bool(int(x)))
-
     df_user_out = df_user.sort_values(["month", "username"]).copy()
 
     df_proj_out.to_csv(proj_path, index=False)
