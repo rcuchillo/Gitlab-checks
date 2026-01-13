@@ -9,4 +9,14 @@ python gitlab_mlops_metrics.py \
   --outdir "./out" \
   --recursive-repo-scan
 
-  
+
+gitlab_adoption_metrics.py
+
+python gitlab_adoption_metrics.py \
+  --group "your-group/path" \
+  --since "2026-01-01T00:00:00Z" \
+  --until "2026-12-31T23:59:59Z" \
+  --outdir "./out" \
+  --forge-prefixes "function_forge" \
+  --src-prefixes "src" \
+  --snapshot-every-month
