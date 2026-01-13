@@ -1,0 +1,115 @@
+level,metric,description,unit,calculation
+project,default_branch_pipeline_coverage_mean,Mean pipeline coverage on default branch in month (if configured).,percent,mean(pipeline.coverage)
+project,default_branch_pipeline_coverage_median,Median pipeline coverage on default branch in month (if configured).,percent,median(pipeline.coverage)
+project,default_branch_pipeline_duration_mean_seconds,Mean default-branch pipeline duration in month.,seconds,mean(pipeline.duration)
+project,default_branch_pipeline_duration_median_seconds,Median default-branch pipeline duration in month.,seconds,median(pipeline.duration)
+project,default_branch_pipeline_success_rate,Success rate on default-branch pipelines in month.,ratio,success/total
+project,default_branch_pipelines_canceled,Canceled default-branch pipelines in month.,count,status=canceled
+project,default_branch_pipelines_failed,Failed default-branch pipelines in month.,count,status=failed
+project,default_branch_pipelines_success,Successful default-branch pipelines in month.,count,status=success
+project,default_branch_pipelines_total,Pipelines on default branch created in month.,count,count pipelines where ref=default_branch by created_at month
+project,docstring_coverage_pct,% of counted functions that have a docstring (snapshot).,percent,100*functions_with_docstring/functions_total
+project,forge_import_symbols_pct,% of imported symbols in src/ + scripts/ coming from Function Forge (snapshot).,percent,100*forge_import_symbols/import_symbols_total
+project,functions_total,Number of Python functions counted by snapshot scan (src/ + scripts/).,count,AST count of function defs
+project,functions_with_docstring,Number of counted functions with a docstring (snapshot).,count,AST: ast.get_docstring(node) != None
+project,has_ci_config,Repo has .gitlab-ci.yml in snapshot.,0/1,1 if .gitlab-ci.yml present
+project,has_configs,Repo has configs/ in snapshot.,0/1,1 if any path starts with configs/
+project,has_docs,Repo has docs/ in snapshot.,0/1,1 if any path starts with docs/
+project,has_notebooks_dir,Repo has notebooks/ in snapshot.,0/1,1 if any path starts with notebooks/
+project,has_requirements_file,Repo has requirements*.txt or pyproject.toml in snapshot.,0/1,1 if any known dependency file present
+project,has_scripts_dir,Repo has scripts/ in snapshot.,0/1,1 if any path starts with scripts/
+project,has_src,Repo has src/ in snapshot.,0/1,1 if any path starts with src/
+project,has_tests,Repo has tests/ in snapshot.,0/1,1 if any path starts with tests/
+project,has_tests_integration,Repo has tests_integration/ in snapshot.,0/1,1 if any path starts with tests_integration/
+project,mr_added_docstring_lines,Docstring-like lines added in Python diffs across merged MRs (heuristic).,lines,sum of added lines between triple-quotes toggles
+project,mr_forge_reuse_score,Diff-based Function Forge reuse score (0-100) for merged MRs.,0-100,100*(0.5*file_hit_rate + 0.5*import_share)
+project,mr_notebooks_added_files,Notebook files added via merged MRs.,count,count .ipynb new_file=true
+project,mr_notebooks_deleted_files,Notebook files deleted via merged MRs.,count,count .ipynb deleted_file=true
+project,mr_notebooks_net_files,Net notebook files via merged MRs (added - deleted).,count,added - deleted
+project,mr_notes_total,Non-system MR comments created in month (project scope).,count,count notes where system=false by note.created_at month
+project,mr_pipeline_adoption_rate,MR pipeline adoption rate for merged MRs.,ratio,mrs_merged_with_mr_pipeline/mrs_merged
+project,mr_pipeline_coverage_mean,Mean coverage of attributed MR pipelines (if configured).,percent,mean(coverages)
+project,mr_pipeline_coverage_median,Median coverage of attributed MR pipelines (if configured).,percent,median(coverages)
+project,mr_pipeline_duration_mean_seconds,Mean duration of attributed MR pipelines.,seconds,mean(durations)
+project,mr_pipeline_duration_median_seconds,Median duration of attributed MR pipelines.,seconds,median(durations)
+project,mr_pipeline_success_rate,Success rate of attributed MR pipelines in month.,ratio,mr_pipelines_success/mr_pipelines_total
+project,mr_pipelines_canceled,Canceled attributed MR pipelines in month.,count,status=canceled
+project,mr_pipelines_failed,Failed attributed MR pipelines in month.,count,status=failed
+project,mr_pipelines_success,Successful attributed MR pipelines in month.,count,status=success
+project,mr_pipelines_total,Attributed MR pipelines in month (one per merged MR in current implementation).,count,count chosen MR pipelines
+project,mr_test_files_touched,Test files touched across merged MRs (tests/ or tests_integration/).,count,sum touched files
+project,mr_test_lines_added,Nonblank lines added in test files across merged MRs.,lines,sum nonblank added lines in test paths
+project,mr_time_to_close_hours_mean,Mean hours from MR creation to close_ts for MRs closed in month.,hours,mean(close_ts-created_at)
+project,mr_time_to_close_hours_median,Median hours from MR creation to close_ts for MRs closed in month.,hours,median(close_ts-created_at)
+project,mrs_closed,MRs closed (merged or closed) in month.,count,close_ts=merged_at if merged else closed_at; bucket by month(close_ts)
+project,mrs_created,MRs created in month (project scope).,count,count MRs by created_at month
+project,mrs_merged,MRs merged in month (project scope).,count,count MRs by merged_at month
+project,mrs_merged_with_mr_pipeline,Merged MRs that had at least one MR pipeline.,count,count merged MRs with non-empty MR pipelines list
+project,notebook_ratio,notebooks_count / (notebooks_count + scripts_count).,ratio,notebooks_count/(notebooks_count+scripts_count)
+project,notebooks_count,Number of *.ipynb files in repo snapshot.,count,count files ending .ipynb
+project,scripts_count,Number of scripts/*.py files in repo snapshot.,count,count scripts/*.py
+project,snapshot_ok,"Snapshot scan succeeded for this project-month (1=yes, 0=no). Use to filter snapshot-based KPIs.",0/1,1 if repo archive downloaded + scanned
+user,comment_events,Comment events by user in month (broader; may include issue comments).,count,events action=commented
+user,commits_estimated,Estimated commits pushed by user in month (from push events).,count,sum(push_data.commit_count)
+user,mr_added_docstring_lines,Docstring-like lines added in Python diffs across user merged MRs (heuristic).,lines,sum per merged MR
+user,mr_forge_reuse_score,Diff-based Function Forge reuse score (0-100) for user merged MRs.,0-100,100*(0.5*file_hit_rate + 0.5*import_share)
+user,mr_notebooks_added_files,Notebook files added via user merged MRs.,count,count .ipynb new_file=true
+user,mr_notebooks_deleted_files,Notebook files deleted via user merged MRs.,count,count .ipynb deleted_file=true
+user,mr_notebooks_net_files,Net notebook files via user merged MRs (added - deleted).,count,added - deleted
+user,mr_notes_written,Non-system MR notes authored by user in month (strict).,count,note.author=user and system=false by month(note.created_at)
+user,mr_pipeline_adoption_rate,MR pipeline adoption rate for user merged MRs.,ratio,mrs_merged_with_mr_pipeline/mrs_merged
+user,mr_pipeline_coverage_mean,Mean attributed MR pipeline coverage for user merged MRs (if configured).,percent,mean(coverages)
+user,mr_pipeline_duration_mean_seconds,Mean attributed MR pipeline duration for user merged MRs.,seconds,mean(durations)
+user,mr_pipeline_duration_median_seconds,Median attributed MR pipeline duration for user merged MRs.,seconds,median(durations)
+user,mr_pipeline_success_rate,Success rate of attributed MR pipelines for user merged MRs.,ratio,success/total
+user,mr_pipelines_canceled,Canceled attributed MR pipelines for user merged MRs.,count,status=canceled
+user,mr_pipelines_failed,Failed attributed MR pipelines for user merged MRs.,count,status=failed
+user,mr_pipelines_success,Successful attributed MR pipelines for user merged MRs.,count,status=success
+user,mr_pipelines_total,Attributed MR pipelines for user merged MRs (one per merged MR in current implementation).,count,count chosen MR pipelines
+user,mr_test_files_touched,Test files touched across user merged MRs.,count,sum per merged MR
+user,mr_test_lines_added,Nonblank test lines added across user merged MRs.,lines,sum per merged MR
+user,mr_time_to_close_hours_mean,Mean time-to-close for user-authored MRs closed in month.,hours,mean(close_ts-created_at)
+user,mr_time_to_close_hours_median,Median time-to-close for user-authored MRs closed in month.,hours,median(close_ts-created_at)
+user,mrs_closed,User-authored MRs closed (merged or closed) in month.,count,bucket by month(close_ts)
+user,mrs_created,MRs created by user in month.,count,author=user and created_at month
+user,mrs_merged,MRs merged authored by user in month.,count,author=user and merged_at month
+user,mrs_merged_with_mr_pipeline,User merged MRs with at least one MR pipeline.,count,count merged MRs with non-empty MR pipelines list
+workspace,default_branch_pipelines_canceled,Total canceled default-branch pipelines across projects.,count,sum(project.default_branch_pipelines_canceled)
+workspace,default_branch_pipelines_failed,Total failed default-branch pipelines across projects.,count,sum(project.default_branch_pipelines_failed)
+workspace,default_branch_pipelines_success,Total successful default-branch pipelines across projects.,count,sum(project.default_branch_pipelines_success)
+workspace,default_branch_pipelines_total,Total default-branch pipelines across projects.,count,sum(project.default_branch_pipelines_total)
+workspace,docstring_coverage_pct,Average project docstring coverage % across projects (snapshot-based).,percent,mean(project.docstring_coverage_pct)
+workspace,forge_import_symbols_pct,Average project Function Forge import-symbol share % across projects (snapshot-based).,percent,mean(project.forge_import_symbols_pct)
+workspace,mr_added_docstring_lines,Total added docstring-like lines across merged MR diffs.,lines,sum(project.mr_added_docstring_lines)
+workspace,mr_notebooks_net_files,Total net notebook file change via merged MRs.,count,sum(project.mr_notebooks_net_files)
+workspace,mr_notes_total,Total MR notes across projects.,count,sum(project.mr_notes_total)
+workspace,mr_pipelines_canceled,Total canceled attributed MR pipelines across projects.,count,sum(project.mr_pipelines_canceled)
+workspace,mr_pipelines_failed,Total failed attributed MR pipelines across projects.,count,sum(project.mr_pipelines_failed)
+workspace,mr_pipelines_success,Total successful attributed MR pipelines across projects.,count,sum(project.mr_pipelines_success)
+workspace,mr_pipelines_total,Total attributed MR pipelines across projects.,count,sum(project.mr_pipelines_total)
+workspace,mr_test_files_touched,Total test files touched across merged MR diffs.,count,sum(project.mr_test_files_touched)
+workspace,mr_test_lines_added,Total nonblank test lines added across merged MR diffs.,lines,sum(project.mr_test_lines_added)
+workspace,mr_time_to_close_hours_mean,Mean of project means for time-to-close.,hours,mean(project.mr_time_to_close_hours_mean)
+workspace,mr_time_to_close_hours_median,Mean of project medians for time-to-close.,hours,mean(project.mr_time_to_close_hours_median)
+workspace,mrs_closed,Total MRs closed across projects.,count,sum(project.mrs_closed)
+workspace,mrs_created,Total MRs created across projects.,count,sum(project.mrs_created)
+workspace,mrs_merged,Total MRs merged across projects.,count,sum(project.mrs_merged)
+workspace,mrs_merged_with_mr_pipeline,Total merged MRs with MR pipeline across projects.,count,sum(project.mrs_merged_with_mr_pipeline)
+workspace,notebook_ratio,Mean of project notebook_ratio values (not the same as workspace_notebook_ratio).,ratio,mean(project.notebook_ratio)
+workspace,notebooks_count,Total notebooks across projects (snapshot-based).,count,sum(project.notebooks_count)
+workspace,pct_projects_has_ci_config,Percent of projects with has_ci_config=1 in the month (snapshot-based).,percent,100*mean(has_ci_config)
+workspace,pct_projects_has_configs,Percent of projects with has_configs=1 in the month (snapshot-based).,percent,100*mean(has_configs)
+workspace,pct_projects_has_docs,Percent of projects with has_docs=1 in the month (snapshot-based).,percent,100*mean(has_docs)
+workspace,pct_projects_has_notebooks_dir,Percent of projects with has_notebooks_dir=1 in the month (snapshot-based).,percent,100*mean(has_notebooks_dir)
+workspace,pct_projects_has_requirements_file,Percent of projects with has_requirements_file=1 in the month (snapshot-based).,percent,100*mean(has_requirements_file)
+workspace,pct_projects_has_scripts_dir,Percent of projects with has_scripts_dir=1 in the month (snapshot-based).,percent,100*mean(has_scripts_dir)
+workspace,pct_projects_has_src,Percent of projects with has_src=1 in the month (snapshot-based).,percent,100*mean(has_src)
+workspace,pct_projects_has_tests,Percent of projects with has_tests=1 in the month (snapshot-based).,percent,100*mean(has_tests)
+workspace,pct_projects_has_tests_integration,Percent of projects with has_tests_integration=1 in the month (snapshot-based).,percent,100*mean(has_tests_integration)
+workspace,projects_count,Number of projects included in workspace aggregation (per month).,count,count projects
+workspace,scripts_count,Total scripts across projects (snapshot-based).,count,sum(project.scripts_count)
+workspace,snapshot_ok,Number of successful project-month snapshots in workspace (per month).,count,sum(snapshot_ok)
+workspace,workspace_default_branch_pipeline_success_rate,Workspace-wide default-branch pipeline success rate (weighted).,ratio,sum(success)/sum(total)
+workspace,workspace_mr_pipeline_adoption_rate,Workspace-wide MR pipeline adoption (merged MRs with MR pipeline / merged MRs).,ratio,sum(mrs_with_pipe)/sum(mrs_merged)
+workspace,workspace_mr_pipeline_success_rate,Workspace-wide MR pipeline success rate (weighted).,ratio,sum(success)/sum(total)
+workspace,workspace_notebook_ratio,Workspace-wide notebook ratio from total notebooks and scripts.,ratio,sum(notebooks)/(sum(notebooks)+sum(scripts))
