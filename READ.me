@@ -20,3 +20,17 @@ python gitlab_adoption_metrics.py \
   --forge-prefixes "function_forge" \
   --src-prefixes "src" \
   --snapshot-every-month
+
+gitlab_mlops_adoption.py
+
+pip install python-gitlab pandas python-dateutil
+export GITLAB_URL="https://gitlab.yourcompany.com"
+export GITLAB_TOKEN="YOUR_ACCESS_TOKEN"
+
+python gitlab_mlops_adoption.py \
+  --group "your-group/path" \
+  --since "2026-01-01T00:00:00Z" \
+  --until "2026-12-31T23:59:59Z" \
+  --outdir "./out" \
+  --forge-prefixes "function_forge" \
+  --log-level INFO
