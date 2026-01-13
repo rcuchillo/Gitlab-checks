@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import io
 import logging
 import math
@@ -13,9 +14,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-import ast
-import pandas as pd
 import gitlab
+import pandas as pd
 from dateutil import parser as dtparser
 from dateutil.relativedelta import relativedelta
 
@@ -24,6 +24,45 @@ from dateutil.relativedelta import relativedelta
 # Logging
 # ----------------------------
 LOG = logging.getLogger("gitlab-mlops-adoption")
+
+
+# ----------------------------
+# Bytes robustness helpers
+# ----------------------------
+def ensure_bytes(x) -> bytes:
+    """Convert various possible http_get/raw return types into bytes."""
+    if x is None:
+        return b""
+    if isinstance(x, bytes):
+        return x
+    if isinstance(x, bytearray):
+        return bytes(x)
+    if isinstance(x, memoryview):
+        return x.tobytes()
+    if hasattr(x, "content"):
+        return x.content  # requests.Response-like
+    if hasattr(x, "data"):
+        try:
+            return bytes(x.data)
+        except Exception:
+            pass
+    if hasattr(x, "read"):
+        return x.read()  # file-like / stream
+    if isinstance(x, str):
+        return x.encode("utf-8", errors="ignore")
+    raise TypeError(f"Expected bytes-like, got {type(x)}")
+
+
+def looks_like_gzip(data: bytes) -> bool:
+    # gzip magic bytes
+    return len(data) >= 2 and data[0] == 0x1F and data[1] == 0x8B
+
+
+def head_preview(data: bytes, n: int = 200) -> str:
+    try:
+        return data[:n].decode("utf-8", errors="replace")
+    except Exception:
+        return repr(data[:n])
 
 
 # ----------------------------
@@ -109,11 +148,12 @@ class GL:
 
     def repo_archive(self, project_id: int, sha_or_ref: str) -> bytes:
         """Repository archive tar.gz for ref/sha."""
-        return self.gl.http_get(
+        data = self.gl.http_get(
             f"/projects/{project_id}/repository/archive",
             query_data={"sha": sha_or_ref},
             raw=True,
         )
+        return ensure_bytes(data)
 
     def mrs_updated_after(self, project, since: datetime) -> List[Any]:
         # We bucket ourselves by created_at / merged_at / closed_at
@@ -141,7 +181,6 @@ class GL:
             return None
 
     def mr_pipelines(self, project_id: int, mr_iid: int) -> List[Dict[str, Any]]:
-        """MR pipelines list (may be empty if not enabled)."""
         try:
             data = self.gl.http_get(f"/projects/{project_id}/merge_requests/{mr_iid}/pipelines")
             return data or []
@@ -188,21 +227,19 @@ class GL:
 # ----------------------------
 # Snapshot scanning helpers
 # ----------------------------
-
 REQ_FILES = [
     "requirements.txt",
     "requirements-dev.txt",
     "requirements_dev.txt",
     "pyproject.toml",
 ]
-
 CI_FILE = ".gitlab-ci.yml"
 IMPORT_LINE_RE = re.compile(r"^\s*(from\s+([A-Za-z_]\w*)\b|import\s+([A-Za-z_]\w*)\b)")
 
 
 @dataclass
 class SnapshotStats:
-    # 0/1 ints (as requested)
+    # 0/1 ints
     has_ci_config: int = 0
     has_configs: int = 0
     has_docs: int = 0
@@ -214,15 +251,15 @@ class SnapshotStats:
     has_requirements_file: int = 0
 
     notebooks_count: int = 0
-    scripts_count: int = 0  # scripts/*.py
-    notebook_ratio: Optional[float] = None  # notebooks/(notebooks+scripts)
+    scripts_count: int = 0
+    notebook_ratio: Optional[float] = None
 
     # docstring coverage of functions
     functions_total: int = 0
     functions_with_docstring: int = 0
     docstring_coverage_pct: Optional[float] = None
 
-    # Function Forge import share
+    # Function Forge import share (imported symbols)
     import_symbols_total: int = 0
     forge_import_symbols: int = 0
     forge_import_symbols_pct: Optional[float] = None
@@ -235,10 +272,6 @@ def extract_python_sources_from_archive(
     max_files: int = 8000,
     max_file_bytes: int = 2_000_000,
 ) -> Dict[str, str]:
-    """
-    Reads .py files from a tar.gz archive into memory.
-    Focused on src/ and scripts/ by default.
-    """
     py_sources: Dict[str, str] = {}
     with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:gz") as tf:
         for m in tf.getmembers():
@@ -268,7 +301,6 @@ def extract_python_sources_from_archive(
             except Exception:
                 continue
             py_sources[norm] = src
-
     return py_sources
 
 
@@ -276,7 +308,6 @@ def scan_snapshot(tar_bytes: bytes, forge_prefixes: List[str]) -> SnapshotStats:
     st = SnapshotStats()
     forge_prefixes = [p.strip() for p in forge_prefixes if p.strip()]
 
-    # First pass: presence + counts
     with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:gz") as tf:
         for m in tf.getmembers():
             if not m.isfile():
@@ -286,7 +317,6 @@ def scan_snapshot(tar_bytes: bytes, forge_prefixes: List[str]) -> SnapshotStats:
 
             if norm == CI_FILE:
                 st.has_ci_config = 1
-
             if norm.startswith("configs/"):
                 st.has_configs = 1
             if norm.startswith("docs/"):
@@ -301,7 +331,6 @@ def scan_snapshot(tar_bytes: bytes, forge_prefixes: List[str]) -> SnapshotStats:
                 st.has_tests_integration = 1
             if norm.startswith("scripts/"):
                 st.has_scripts_dir = 1
-
             if any(norm == rf for rf in REQ_FILES):
                 st.has_requirements_file = 1
 
@@ -313,7 +342,7 @@ def scan_snapshot(tar_bytes: bytes, forge_prefixes: List[str]) -> SnapshotStats:
     denom = st.notebooks_count + st.scripts_count
     st.notebook_ratio = (st.notebooks_count / denom) if denom > 0 else None
 
-    # Second pass: AST for docstring coverage + import share
+    # AST for docstring coverage + import share
     py_sources = extract_python_sources_from_archive(tar_bytes, include_prefixes=("src/", "scripts/"))
 
     import_symbols_total = 0
@@ -360,9 +389,8 @@ def scan_snapshot(tar_bytes: bytes, forge_prefixes: List[str]) -> SnapshotStats:
 
 
 # ----------------------------
-# MR diff contributions (merged MRs)
+# MR diff contributions + MR pipeline attribution
 # ----------------------------
-
 TRIPLE_RE = re.compile(r"'''|\"\"\"")
 
 
@@ -437,14 +465,12 @@ def compute_diff_contrib(changes_payload: Dict[str, Any], forge_prefixes: List[s
         new_file = bool(ch.get("new_file"))
         deleted_file = bool(ch.get("deleted_file"))
 
-        # notebooks delta
         if path.endswith(".ipynb"):
             if new_file:
                 acc.notebooks_added_files += 1
             if deleted_file:
                 acc.notebooks_deleted_files += 1
 
-        # tests touched
         is_test = path.startswith("tests/") or path.startswith("tests_integration/")
         if is_test:
             acc.test_files_touched += 1
@@ -582,7 +608,7 @@ def main() -> int:
                 "mrs_merged": 0,
                 "mr_notes_total": 0,
 
-                # NEW: MR close metrics
+                # MR close metrics
                 "mrs_closed": 0,
                 "mr_time_to_close_hours_median": None,
                 "mr_time_to_close_hours_mean": None,
@@ -634,10 +660,10 @@ def main() -> int:
                 "commits_estimated": 0,
                 "mrs_created": 0,
                 "mrs_merged": 0,
-                "mr_notes_written": 0,   # strict: MR notes authored
-                "comment_events": 0,     # broad: events action=commented
+                "mr_notes_written": 0,  # strict: MR notes authored
+                "comment_events": 0,    # broad: events action=commented
 
-                # NEW: MR close metrics (user)
+                # MR close metrics
                 "mrs_closed": 0,
                 "mr_time_to_close_hours_median": None,
                 "mr_time_to_close_hours_mean": None,
@@ -667,7 +693,6 @@ def main() -> int:
     diff_acc_proj: Dict[Tuple[int, str], DiffContribAcc] = {}
     diff_acc_user: Dict[Tuple[int, str], DiffContribAcc] = {}
 
-    # NEW: MR close time accumulators
     close_times_proj: Dict[Tuple[int, str], List[float]] = {}
     close_times_user: Dict[Tuple[int, str], List[float]] = {}
 
@@ -699,7 +724,7 @@ def main() -> int:
                 user_rows[(uid, mk)]["comment_events"] += 1
 
     # ----------------------------
-    # Per-project: MRs, notes, MR close time, MR diffs + MR pipeline CI attribution
+    # Per-project: MRs, notes, close time, MR diffs + MR pipeline CI attribution
     # ----------------------------
     LOG.info("Collecting MR volumes, notes, close time, MR diff contributions, and MR pipeline CI attribution...")
     for idx, project in enumerate(projects, start=1):
@@ -720,7 +745,7 @@ def main() -> int:
             merged_at = parse_dt(getattr(mr, "merged_at", None))
             closed_at = parse_dt(getattr(mr, "closed_at", None))
 
-            # MR created volume
+            # Created volume
             if created_at:
                 mk = month_key(created_at)
                 if (pid, mk) in project_rows:
@@ -728,7 +753,7 @@ def main() -> int:
                 if author_id and (author_id, mk) in user_rows:
                     user_rows[(author_id, mk)]["mrs_created"] += 1
 
-            # MR merged volume
+            # Merged volume
             merged_month = None
             if state == "merged" and merged_at:
                 mk = month_key(merged_at)
@@ -738,7 +763,7 @@ def main() -> int:
                     user_rows[(author_id, mk)]["mrs_merged"] += 1
                 merged_month = mk
 
-            # NEW: time to close (merged or closed), bucket by close timestamp month
+            # Time to close (merged or closed), bucket by close timestamp month
             close_ts = None
             if state == "merged" and merged_at:
                 close_ts = merged_at
@@ -755,7 +780,7 @@ def main() -> int:
                     user_rows[(author_id, mk)]["mrs_closed"] += 1
                     close_times_user.setdefault((author_id, mk), []).append(hrs)
 
-            # Notes volume (bucket by note timestamp)
+            # Notes volume
             notes = gl.mr_notes(mr)
             for n in notes:
                 if getattr(n, "system", False):
@@ -771,13 +796,12 @@ def main() -> int:
                 if na and (na, mk) in user_rows:
                     user_rows[(na, mk)]["mr_notes_written"] += 1
 
-            # MR diff contributions + MR pipeline CI (only for merged MRs, attributed to merge month)
+            # MR diff contributions + MR pipeline CI (only for merged MRs)
             if merged_month and author_id and (pid, merged_month) in project_rows and (author_id, merged_month) in user_rows:
-                # 1) MR diff contributions
+                # Diff contribution
                 changes = gl.mr_changes(pid, mr_iid)
                 if changes:
                     acc = compute_diff_contrib(changes, forge_prefixes)
-
                     diff_acc_proj.setdefault((pid, merged_month), DiffContribAcc())
                     diff_acc_user.setdefault((author_id, merged_month), DiffContribAcc())
 
@@ -792,7 +816,7 @@ def main() -> int:
                         dst.forge_imports_added += acc.forge_imports_added
                         dst.forge_files_hit += acc.forge_files_hit
 
-                # 2) MR pipeline CI attribution (latest MR pipeline)
+                # MR pipeline attribution (latest MR pipeline)
                 mr_pipes = gl.mr_pipelines(pid, mr_iid)
                 if mr_pipes:
                     mr_pipes_sorted = sorted(
@@ -812,6 +836,7 @@ def main() -> int:
                                     diff_acc_user.setdefault((author_id, merged_month), DiffContribAcc())):
                             dst.mr_pipelines_total += 1
                             dst.mrs_merged_with_mr_pipeline += 1
+
                             if status == "success":
                                 dst.mr_pipelines_success += 1
                             elif status == "failed":
@@ -827,7 +852,7 @@ def main() -> int:
                             except Exception:
                                 pass
 
-    # Finalize MR close time mean/median
+    # Close-time finalization
     LOG.info("Finalizing MR close-time metrics...")
     for (pid, mk), vals in close_times_proj.items():
         project_rows[(pid, mk)]["mr_time_to_close_hours_median"] = safe_median(vals)
@@ -837,7 +862,7 @@ def main() -> int:
         user_rows[(uid, mk)]["mr_time_to_close_hours_median"] = safe_median(vals)
         user_rows[(uid, mk)]["mr_time_to_close_hours_mean"] = safe_mean(vals)
 
-    # Write diff aggregates + MR pipeline stats into rows
+    # Diff aggregates + MR pipeline stats into rows
     LOG.info("Finalizing diff-based contribution metrics and MR pipeline CI stats...")
     for (pid, mk), acc in diff_acc_proj.items():
         row = project_rows[(pid, mk)]
@@ -926,7 +951,6 @@ def main() -> int:
             except Exception:
                 pass
 
-        # Fill into project rows
         for mk in months:
             row = project_rows[(pid, mk)]
             row["default_branch_pipelines_total"] = total_by_month[mk]
@@ -948,10 +972,20 @@ def main() -> int:
                 continue
             try:
                 tar_bytes = gl.repo_archive(pid, sha)
+                LOG.debug("Archive %s %s: type=%s size=%s", pname, mk, type(tar_bytes), len(tar_bytes))
+
+                if not looks_like_gzip(tar_bytes):
+                    # Often indicates an HTML error page from GitLab/proxy
+                    LOG.warning(
+                        "Snapshot failed for %s %s: archive is not gzip; head=%r",
+                        pname, mk, head_preview(tar_bytes)
+                    )
+                    continue
+
                 st = scan_snapshot(tar_bytes, forge_prefixes)
 
                 row = project_rows[(pid, mk)]
-                row["snapshot_ok"] = 1  # success
+                row["snapshot_ok"] = 1
                 row["has_ci_config"] = st.has_ci_config
                 row["has_configs"] = st.has_configs
                 row["has_docs"] = st.has_docs
@@ -971,8 +1005,7 @@ def main() -> int:
                 row["notebook_ratio"] = st.notebook_ratio
 
             except Exception as e:
-                # keep 0/1 folder flags at their default 0, but mark snapshot_ok=0 (already)
-                LOG.warning("  Snapshot failed for %s %s: %s", pname, mk, str(e))
+                LOG.warning("Snapshot failed for %s %s: %s", pname, mk, str(e))
 
     # ----------------------------
     # Workspace aggregation (namespace-level)
@@ -981,7 +1014,6 @@ def main() -> int:
     df_proj = pd.DataFrame(list(project_rows.values()))
     df_user = pd.DataFrame(list(user_rows.values()))
 
-    # Folder flags are already 0/1; workspace % = mean * 100
     folder_cols = [
         "has_ci_config", "has_configs", "has_docs", "has_notebooks_dir", "has_src", "has_tests",
         "has_tests_integration", "has_scripts_dir", "has_requirements_file",
@@ -994,17 +1026,16 @@ def main() -> int:
         "forge_import_symbols_pct": "mean",
         "notebooks_count": "sum",
         "scripts_count": "sum",
-        "notebook_ratio": "mean",  # mean of project ratios
+        "notebook_ratio": "mean",
 
         "mrs_created": "sum",
         "mrs_merged": "sum",
         "mr_notes_total": "sum",
 
         "mrs_closed": "sum",
-        "mr_time_to_close_hours_median": "mean",  # mean of medians across projects
+        "mr_time_to_close_hours_median": "mean",
         "mr_time_to_close_hours_mean": "mean",
 
-        # default branch pipelines totals
         "default_branch_pipelines_total": "sum",
         "default_branch_pipelines_success": "sum",
         "default_branch_pipelines_failed": "sum",
@@ -1014,7 +1045,6 @@ def main() -> int:
         "default_branch_pipeline_coverage_median": "mean",
         "default_branch_pipeline_coverage_mean": "mean",
 
-        # MR pipeline totals
         "mr_pipelines_total": "sum",
         "mr_pipelines_success": "sum",
         "mr_pipelines_failed": "sum",
@@ -1025,21 +1055,18 @@ def main() -> int:
         "mr_pipeline_coverage_median": "mean",
         "mr_pipeline_coverage_mean": "mean",
 
-        # diff contribution totals
         "mr_added_docstring_lines": "sum",
         "mr_test_files_touched": "sum",
         "mr_test_lines_added": "sum",
         "mr_notebooks_net_files": "sum",
     }).rename(columns={"project_id": "projects_count"})
 
-    # workspace notebook ratio across totals
     def _ws_ratio(row):
         denom = (row["notebooks_count"] + row["scripts_count"])
         return (row["notebooks_count"] / denom) if denom and denom > 0 else None
 
     workspace["workspace_notebook_ratio"] = workspace.apply(_ws_ratio, axis=1)
 
-    # Weighted workspace pipeline success rate
     workspace["workspace_default_branch_pipeline_success_rate"] = workspace.apply(
         lambda r: (r["default_branch_pipelines_success"] / r["default_branch_pipelines_total"])
         if r["default_branch_pipelines_total"] else None,
@@ -1056,13 +1083,12 @@ def main() -> int:
         axis=1,
     )
 
-    # Folder adoption percentages (only meaningful where snapshot_ok>0)
-    # If you want to exclude failed snapshots from % calculations, filter df_proj[df_proj.snapshot_ok==1] here.
+    # folder adoption %
     for c in folder_cols:
         workspace[f"pct_projects_{c}"] = 100.0 * df_proj.groupby("month")[c].mean().values
 
     # ----------------------------
-    # Write CSVs (folder flags remain 0/1)
+    # Write CSVs
     # ----------------------------
     os.makedirs(args.outdir, exist_ok=True)
 
@@ -1070,11 +1096,8 @@ def main() -> int:
     user_path = os.path.join(args.outdir, "user_monthly.csv")
     ws_path = os.path.join(args.outdir, "workspace_monthly.csv")
 
-    df_proj_out = df_proj.sort_values(["month", "project"]).copy()
-    df_user_out = df_user.sort_values(["month", "username"]).copy()
-
-    df_proj_out.to_csv(proj_path, index=False)
-    df_user_out.to_csv(user_path, index=False)
+    df_proj.sort_values(["month", "project"]).to_csv(proj_path, index=False)
+    df_user.sort_values(["month", "username"]).to_csv(user_path, index=False)
     workspace.sort_values(["month"]).to_csv(ws_path, index=False)
 
     LOG.info("Wrote: %s", proj_path)
