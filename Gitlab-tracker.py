@@ -1,1122 +1,1111 @@
 #!/usr/bin/env python3
-"""
-gitlab_mlops_adoption.py
-
-Track MLOps adoption and contributions on GitLab at:
-- Project level
-- Workspace (Group) level (aggregated across projects)
-- User level (commits, MRs, comments + contribution signals from MR diffs)
-
-Outputs:
-- CSV files per metric family
-- A JSON summary file
-
-Requires:
-- Python 3.9+
-- requests
-
-Auth:
-- GitLab Personal Access Token (PAT) with API scope
-
-Example:
-  python gitlab_mlops_adoption.py \
-    --base-url https://gitlab.example.com \
-    --token $GITLAB_TOKEN \
-    --group-id 12345 \
-    --function-forge-names function_forge,function-forge \
-    --outdir ./out \
-    --log-level INFO
-"""
-
 from __future__ import annotations
 
 import argparse
-import base64
-import csv
-import datetime as dt
-import json
+import ast
+import io
 import logging
+import math
 import os
 import re
 import sys
-import time
-from dataclasses import dataclass, asdict
-from typing import Any, Dict, Generator, Iterable, List, Optional, Tuple
+import tarfile
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple
 
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+import gitlab
+import pandas as pd
+from dateutil import parser as dtparser
+from dateutil.relativedelta import relativedelta
 
-# -----------------------------
+
+# ----------------------------
 # Logging
-# -----------------------------
-
-LOGGER = logging.getLogger("gitlab_mlops_adoption")
-
-
-def setup_logger(level: str) -> None:
-    """Configure logging with a readable format."""
-    logging.basicConfig(
-        level=getattr(logging, level.upper(), logging.INFO),
-        format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
+# ----------------------------
+LOG = logging.getLogger("gitlab-mlops-adoption")
 
 
-# -----------------------------
-# Date helpers (monthly windows)
-# -----------------------------
+# ----------------------------
+# Bytes robustness helpers
+# ----------------------------
+def ensure_bytes(x) -> bytes:
+    """Convert various possible http_get/raw return types into bytes."""
+    if x is None:
+        return b""
+    if isinstance(x, bytes):
+        return x
+    if isinstance(x, bytearray):
+        return bytes(x)
+    if isinstance(x, memoryview):
+        return x.tobytes()
+    if hasattr(x, "content"):
+        return x.content  # requests.Response-like
+    if hasattr(x, "data"):
+        try:
+            return bytes(x.data)
+        except Exception:
+            pass
+    if hasattr(x, "read"):
+        return x.read()  # file-like / stream
+    if isinstance(x, str):
+        return x.encode("utf-8", errors="ignore")
+    raise TypeError(f"Expected bytes-like, got {type(x)}")
 
-def first_day_of_month(d: dt.date) -> dt.date:
-    """Return the first day of the month for a given date."""
-    return dt.date(d.year, d.month, 1)
+
+def looks_like_gzip(data: bytes) -> bool:
+    # gzip magic bytes
+    return len(data) >= 2 and data[0] == 0x1F and data[1] == 0x8B
 
 
-def add_months(d: dt.date, months: int) -> dt.date:
-    """Add months to a date, keeping day=1 safe for month windows."""
-    year = d.year + (d.month - 1 + months) // 12
-    month = (d.month - 1 + months) % 12 + 1
-    return dt.date(year, month, 1)
+def head_preview(data: bytes, n: int = 200) -> str:
+    try:
+        return data[:n].decode("utf-8", errors="replace")
+    except Exception:
+        return repr(data[:n])
 
 
-def month_windows_last_full_months(n_months: int, today: Optional[dt.date] = None) -> List[Tuple[dt.date, dt.date]]:
-    """
-    Return a list of (start_date, end_date) for the last n full months.
-    end_date is inclusive.
-    """
-    today = today or dt.date.today()
-    this_month_start = first_day_of_month(today)
-    last_month_start = add_months(this_month_start, -1)
+# ----------------------------
+# Date helpers
+# ----------------------------
+def parse_dt(x: Optional[str]) -> Optional[datetime]:
+    if not x:
+        return None
+    dt = dtparser.isoparse(x)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
-    windows: List[Tuple[dt.date, dt.date]] = []
-    cursor_start = add_months(last_month_start, -(n_months - 1))
 
-    for i in range(n_months):
-        start = add_months(cursor_start, i)
-        next_start = add_months(start, 1)
-        end = next_start - dt.timedelta(days=1)
-        windows.append((start, end))
+def month_start(dt: datetime) -> datetime:
+    return datetime(dt.year, dt.month, 1, tzinfo=timezone.utc)
+
+
+def month_key(dt: datetime) -> str:
+    return f"{dt.year:04d}-{dt.month:02d}"
+
+
+def iter_month_windows(since: datetime, until: datetime) -> List[Tuple[str, datetime, datetime]]:
+    """Returns list of (YYYY-MM, start_dt, end_dt_inclusive)."""
+    windows = []
+    cur = month_start(since)
+    end_month = month_start(until)
+    while cur <= end_month:
+        nxt = cur + relativedelta(months=1)
+        end = min(until, nxt - relativedelta(seconds=1))
+        windows.append((month_key(cur), cur, end))
+        cur = nxt
     return windows
 
 
-def iso_datetime_range(start: dt.date, end: dt.date) -> Tuple[str, str]:
-    """Convert date range to ISO datetimes (GitLab API expects timestamps)."""
-    start_dt = dt.datetime.combine(start, dt.time.min).isoformat()
-    end_dt = dt.datetime.combine(end, dt.time.max).isoformat()
-    return start_dt, end_dt
+def safe_mean(xs: List[Optional[float]]) -> Optional[float]:
+    vals = [x for x in xs if x is not None and not math.isnan(x)]
+    return (sum(vals) / len(vals)) if vals else None
 
 
-# -----------------------------
-# GitLab API client
-# -----------------------------
+def safe_median(xs: List[Optional[float]]) -> Optional[float]:
+    vals = sorted([x for x in xs if x is not None and not math.isnan(x)])
+    if not vals:
+        return None
+    mid = len(vals) // 2
+    return vals[mid] if len(vals) % 2 == 1 else (vals[mid - 1] + vals[mid]) / 2
 
-class GitLabClient:
-    """
-    Minimal GitLab REST client with pagination + retries.
-    """
 
-    def __init__(self, base_url: str, token: str, timeout_s: int = 30) -> None:
-        self.base_url = base_url.rstrip("/")
-        self.timeout_s = timeout_s
-        self.session = requests.Session()
-        self.session.headers.update({"PRIVATE-TOKEN": token})
+# ----------------------------
+# GitLab client
+# ----------------------------
+class GL:
+    def __init__(self, url: str, token: str, per_page: int = 100):
+        self.gl = gitlab.Gitlab(url=url, private_token=token, per_page=per_page)
+        self.gl.auth()
 
-        retries = Retry(
-            total=6,
-            backoff_factor=0.8,
-            status_forcelist=(429, 500, 502, 503, 504),
-            allowed_methods=("GET", "POST", "PUT", "DELETE"),
-            raise_on_status=False,
-        )
-        adapter = HTTPAdapter(max_retries=retries, pool_connections=20, pool_maxsize=20)
-        self.session.mount("http://", adapter)
-        self.session.mount("https://", adapter)
+    def group_projects(self, group_path: str, include_subgroups: bool) -> List[Any]:
+        g = self.gl.groups.get(group_path)
+        ps = g.projects.list(include_subgroups=include_subgroups, all=True)
+        out = []
+        for p in ps:
+            try:
+                out.append(self.gl.projects.get(p.id))
+            except gitlab.exceptions.GitlabGetError:
+                continue
+        return out
 
-    def _url(self, path: str) -> str:
-        return f"{self.base_url}/api/v4{path}"
+    def group_members(self, group_path: str) -> List[Tuple[int, str, str]]:
+        g = self.gl.groups.get(group_path)
+        members = g.members.list(all=True)
+        out = []
+        for m in members:
+            out.append((m.id, getattr(m, "username", "") or "", getattr(m, "name", "") or ""))
+        return out
 
-    def get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Any:
-        """GET a GitLab API resource and return JSON."""
-        url = self._url(path)
-        resp = self.session.get(url, params=params or {}, timeout=self.timeout_s)
-        if resp.status_code >= 400:
-            LOGGER.warning("GET %s failed: %s %s", url, resp.status_code, resp.text[:300])
-            resp.raise_for_status()
-        return resp.json()
-
-    def get_paginated(self, path: str, params: Optional[Dict[str, Any]] = None) -> Generator[Any, None, None]:
-        """
-        Yield items across all pages (GitLab uses X-Next-Page headers).
-        """
-        url = self._url(path)
-        page = 1
-        params = dict(params or {})
-        params.setdefault("per_page", 100)
-
-        while True:
-            params["page"] = page
-            resp = self.session.get(url, params=params, timeout=self.timeout_s)
-            if resp.status_code >= 400:
-                LOGGER.warning("GET(paginated) %s failed: %s %s", url, resp.status_code, resp.text[:300])
-                resp.raise_for_status()
-
-            items = resp.json()
-            if not isinstance(items, list):
-                raise ValueError(f"Expected list response for {path}, got: {type(items)}")
-
-            for item in items:
-                yield item
-
-            next_page = resp.headers.get("X-Next-Page")
-            if not next_page:
-                break
-            page = int(next_page)
-
-    # ---- group / projects ----
-
-    def list_group_projects(self, group_id: int) -> List[Dict[str, Any]]:
-        """List projects for a group (workspace)."""
-        LOGGER.info("Listing projects for group_id=%s", group_id)
-        projects = list(
-            self.get_paginated(
-                f"/groups/{group_id}/projects",
-                params={"include_subgroups": True, "archived": False, "simple": False, "order_by": "path", "sort": "asc"},
-            )
-        )
-        LOGGER.info("Found %d projects", len(projects))
-        return projects
-
-    # ---- repo tree / files ----
-
-    def list_repository_tree(self, project_id: int, ref: str, recursive: bool = True) -> List[Dict[str, Any]]:
-        """List repository tree entries for a project at a ref."""
-        params = {"ref": ref, "recursive": recursive}
-        return list(self.get_paginated(f"/projects/{project_id}/repository/tree", params=params))
-
-    def get_file(self, project_id: int, file_path: str, ref: str) -> Optional[str]:
-        """
-        Fetch file content as text. Returns None on errors (e.g., binary or too large).
-        """
-        encoded_path = requests.utils.quote(file_path, safe="")
+    def latest_sha_before(self, project, ref: str, until: datetime) -> Optional[str]:
+        """Latest commit sha on ref at or before 'until'."""
         try:
-            data = self.get(f"/projects/{project_id}/repository/files/{encoded_path}", params={"ref": ref})
-            content_b64 = data.get("content", "")
-            if not content_b64:
-                return None
-            decoded = base64.b64decode(content_b64).decode("utf-8", errors="replace")
-            return decoded
-        except Exception as e:
-            LOGGER.debug("Failed to fetch file %s@%s: %s", file_path, ref, e)
+            commits = project.commits.list(ref_name=ref, until=until.isoformat(), per_page=1, get_all=False)
+            return commits[0].id if commits else None
+        except Exception:
             return None
 
-    def get_project(self, project_id: int) -> Dict[str, Any]:
-        """Get project metadata."""
-        return self.get(f"/projects/{project_id}")
-
-    # ---- pipelines ----
-
-    def list_pipelines(self, project_id: int, ref: Optional[str], updated_after: str, updated_before: str) -> List[Dict[str, Any]]:
-        """List pipelines in a time range."""
-        params = {
-            "updated_after": updated_after,
-            "updated_before": updated_before,
-            "per_page": 100,
-        }
-        if ref:
-            params["ref"] = ref
-        return list(self.get_paginated(f"/projects/{project_id}/pipelines", params=params))
-
-    def get_pipeline(self, project_id: int, pipeline_id: int) -> Dict[str, Any]:
-        """Get a pipeline (includes coverage if configured)."""
-        return self.get(f"/projects/{project_id}/pipelines/{pipeline_id}")
-
-    # ---- merge requests ----
-
-    def list_merge_requests(self, project_id: int, created_after: str, created_before: str, state: str = "all") -> List[Dict[str, Any]]:
-        """List merge requests by creation date range."""
-        params = {
-            "created_after": created_after,
-            "created_before": created_before,
-            "state": state,
-            "per_page": 100,
-            "order_by": "created_at",
-            "sort": "asc",
-        }
-        return list(self.get_paginated(f"/projects/{project_id}/merge_requests", params=params))
-
-    def list_merge_requests_merged_in_range(self, project_id: int, merged_after: str, merged_before: str) -> List[Dict[str, Any]]:
-        """List merge requests merged within a range (best-effort via updated_after + filter)."""
-        # GitLab doesn't provide merged_after/merged_before universally across all editions in same way.
-        # We'll pull updated in range and then filter by merged_at in Python.
-        params = {
-            "updated_after": merged_after,
-            "updated_before": merged_before,
-            "state": "merged",
-            "per_page": 100,
-            "order_by": "updated_at",
-            "sort": "asc",
-        }
-        mrs = list(self.get_paginated(f"/projects/{project_id}/merge_requests", params=params))
-        out = []
-        for mr in mrs:
-            merged_at = mr.get("merged_at")
-            if not merged_at:
-                continue
-            merged_dt = parse_gitlab_dt(merged_at)
-            if merged_dt is None:
-                continue
-            if merged_dt >= parse_gitlab_dt(merged_after) and merged_dt <= parse_gitlab_dt(merged_before):
-                out.append(mr)
-        return out
-
-    def get_mr_changes(self, project_id: int, mr_iid: int) -> Dict[str, Any]:
-        """Get MR changes (includes per-file diffs)."""
-        return self.get(f"/projects/{project_id}/merge_requests/{mr_iid}/changes")
-
-    def list_mr_commits(self, project_id: int, mr_iid: int) -> List[Dict[str, Any]]:
-        """List commits for a merge request (proxy for 'commits before MR raised')."""
-        return list(self.get_paginated(f"/projects/{project_id}/merge_requests/{mr_iid}/commits"))
-
-    def list_mr_notes(self, project_id: int, mr_iid: int) -> List[Dict[str, Any]]:
-        """List notes/comments for a merge request."""
-        return list(self.get_paginated(f"/projects/{project_id}/merge_requests/{mr_iid}/notes"))
-
-    # ---- commits (user volumes) ----
-
-    def list_commits(self, project_id: int, since: str, until: str, author: Optional[str] = None) -> List[Dict[str, Any]]:
-        """List commits in a time range (optionally filtered by author)."""
-        params = {"since": since, "until": until, "per_page": 100}
-        if author:
-            params["author"] = author
-        return list(self.get_paginated(f"/projects/{project_id}/repository/commits", params=params))
-
-
-# -----------------------------
-# Parsing helpers
-# -----------------------------
-
-def parse_gitlab_dt(s: str) -> Optional[dt.datetime]:
-    """Parse GitLab ISO timestamps robustly."""
-    if not s:
-        return None
-    try:
-        # GitLab examples: "2025-12-31T12:34:56.123Z" or with offset
-        s2 = s.replace("Z", "+00:00")
-        return dt.datetime.fromisoformat(s2)
-    except Exception:
-        return None
-
-
-# -----------------------------
-# Static repo analysis (AST)
-# -----------------------------
-
-@dataclass
-class RepoSnapshotMetrics:
-    # structure
-    has_configs: int
-    has_docs: int
-    has_notebooks: int
-    has_requirements: int
-    has_src: int
-    has_tests: int
-    has_tests_integration: int
-
-    # code
-    volume_functions: int
-    volume_functions_with_docstrings: int
-    pct_functions_with_docstrings: float
-
-    volume_function_calls: int
-    volume_function_forge_calls: int
-    pct_function_forge_calls: float
-
-    # artifacts
-    volume_notebooks: int
-    volume_scripts: int
-    pct_scripts_over_notebooks_plus_scripts: float
-
-    # CI / lifecycle (snapshot-ish, filled elsewhere)
-    latest_pipeline_coverage: Optional[float]
-
-
-@dataclass
-class MonthlyProjectMetrics:
-    project_id: int
-    project_path: str
-    month_start: str
-    month_end: str
-
-    pipelines_count: int
-    avg_pipeline_coverage: Optional[float]
-
-    merged_mrs_count: int
-    avg_time_to_merge_hours: Optional[float]
-    avg_mr_commits: Optional[float]
-
-    # adoption contribution signals from MR diffs (net changes merged in month)
-    net_notebooks: int
-    net_scripts: int
-    net_docstring_additions: int
-    net_tests_files_added: int
-    net_function_forge_imports_added: int
-
-
-@dataclass
-class MonthlyUserMetrics:
-    user_id: int
-    user_name: str
-    user_username: str
-    month_start: str
-    month_end: str
-
-    commits_count: int
-    mrs_authored_count: int
-    comments_count: int
-
-    # contribution signals from MRs authored+merged in month
-    notebooks_reduced: int
-    docstrings_added: int
-    tests_added: int
-    function_forge_added: int
-
-
-# -----------------------------
-# Heuristics for diffs (MLOps contributions)
-# -----------------------------
-
-_DIFF_HUNK_RE = re.compile(r"^@@", re.MULTILINE)
-_DEF_LINE_RE = re.compile(r"^\+\s*def\s+\w+\s*\(", re.MULTILINE)
-_DOCSTRING_LINE_RE = re.compile(r'^\+\s*(?:r|u|f|fr|rf)?("""|\'\'\')', re.MULTILINE)
-_FUNCTION_FORGE_IMPORT_RE = re.compile(r"^\+\s*(from\s+function_forge\b|import\s+function_forge\b)", re.MULTILINE)
-
-def classify_script_path(path: str) -> bool:
-    """
-    Heuristic: treat "scripts" as files under scripts/ OR top-level runnable python,
-    excluding src/ and tests/ and notebooks.
-    """
-    p = path.lower()
-    if p.endswith(".py"):
-        if p.startswith("src/") or p.startswith("tests/") or p.startswith("test/") or p.startswith("notebooks/"):
-            return False
-        if p.startswith("scripts/"):
-            return True
-        # top-level python file
-        if "/" not in p:
-            return True
-        # other folders - leave as False by default
-    if p.endswith(".sh") and p.startswith("scripts/"):
-        return True
-    return False
-
-
-def count_docstring_additions_in_patch(patch: str) -> int:
-    """
-    Best-effort docstring additions:
-    - count added def lines and nearby added triple-quote lines.
-    This is approximate but works well in practice.
-    """
-    if not patch:
-        return 0
-    # Simple: count added triple quote lines (docstrings or multi-line strings)
-    # but constrain by also requiring at least one added 'def' in the patch.
-    defs = len(_DEF_LINE_RE.findall(patch))
-    if defs == 0:
-        return 0
-    doc_lines = len(_DOCSTRING_LINE_RE.findall(patch))
-    return min(doc_lines, defs) if doc_lines else 0
-
-
-def count_function_forge_imports_added(patch: str) -> int:
-    """Count added lines importing function_forge."""
-    if not patch:
-        return 0
-    return len(_FUNCTION_FORGE_IMPORT_RE.findall(patch))
-
-
-# -----------------------------
-# Repo analyzer
-# -----------------------------
-
-class RepoAnalyzer:
-    """
-    Analyze repository snapshot at default branch for structure + code metrics.
-    Uses GitLab repository tree + file API (no git clone).
-    """
-
-    def __init__(
-        self,
-        gl: GitLabClient,
-        function_forge_names: List[str],
-        max_python_files: int = 1500,
-        max_file_bytes: int = 1_000_000,
-        exclude_dirs: Optional[List[str]] = None,
-    ) -> None:
-        self.gl = gl
-        self.function_forge_names = [n.strip() for n in function_forge_names if n.strip()]
-        self.max_python_files = max_python_files
-        self.max_file_bytes = max_file_bytes
-        self.exclude_dirs = [d.strip().lower().strip("/") for d in (exclude_dirs or ["venv", ".venv", ".git", "dist", "build", "__pycache__", ".mypy_cache", ".ruff_cache"])]
-
-    def snapshot_metrics(self, project_id: int, ref: str) -> RepoSnapshotMetrics:
-        """Compute adoption snapshot metrics on a given ref."""
-        LOGGER.info("Analyzing repo snapshot project_id=%s ref=%s", project_id, ref)
-        tree = self.gl.list_repository_tree(project_id, ref=ref, recursive=True)
-
-        paths = [t["path"] for t in tree if "path" in t]
-        paths_lower = [p.lower() for p in paths]
-
-        has_configs = int(any(p.startswith("configs/") or p == "configs" for p in paths_lower))
-        has_docs = int(any(p.startswith("docs/") or p == "docs" for p in paths_lower))
-        has_notebooks_folder = int(any(p.startswith("notebooks/") or p == "notebooks" for p in paths_lower))
-        has_src = int(any(p.startswith("src/") or p == "src" for p in paths_lower))
-        has_tests = int(any(p.startswith("tests/") or p == "tests" for p in paths_lower))
-        has_tests_integration = int(any(p.startswith("tests_integration/") or p == "tests_integration" for p in paths_lower))
-
-        has_requirements = int(
-            any(p in ("requirements.txt", "pyproject.toml", "setup.cfg", "setup.py") for p in paths_lower)
-            or any(p.startswith("requirements/") or p == "requirements" for p in paths_lower)
+    def repo_archive(self, project_id: int, sha_or_ref: str) -> bytes:
+        """Repository archive tar.gz for ref/sha."""
+        data = self.gl.http_get(
+            f"/projects/{project_id}/repository/archive",
+            query_data={"sha": sha_or_ref},
+            raw=True,
         )
+        return ensure_bytes(data)
 
-        notebook_paths = [p for p in paths if p.lower().endswith(".ipynb")]
-        python_paths = [p for p in paths if p.lower().endswith(".py")]
+    def mrs_updated_after(self, project, since: datetime) -> List[Any]:
+        # We bucket ourselves by created_at / merged_at / closed_at
+        try:
+            return project.mergerequests.list(
+                state="all",
+                scope="all",
+                updated_after=since.isoformat(),
+                per_page=100,
+                get_all=True,
+            )
+        except Exception:
+            return []
 
-        volume_notebooks = len(notebook_paths)
-        volume_scripts = sum(1 for p in paths if classify_script_path(p))
+    def mr_notes(self, mr) -> List[Any]:
+        try:
+            return mr.notes.list(get_all=True)
+        except Exception:
+            return []
 
-        # AST-based metrics (best-effort, bounded)
-        volume_functions = 0
-        volume_functions_with_docstrings = 0
-        volume_calls = 0
-        volume_ff_calls = 0
+    def mr_changes(self, project_id: int, mr_iid: int) -> Optional[Dict[str, Any]]:
+        try:
+            return self.gl.http_get(f"/projects/{project_id}/merge_requests/{mr_iid}/changes")
+        except Exception:
+            return None
 
-        python_paths_filtered = self._filter_paths(python_paths)
-        if len(python_paths_filtered) > self.max_python_files:
-            LOGGER.warning("Too many python files (%d). Truncating to %d for analysis.",
-                           len(python_paths_filtered), self.max_python_files)
-            python_paths_filtered = python_paths_filtered[: self.max_python_files]
+    def mr_pipelines(self, project_id: int, mr_iid: int) -> List[Dict[str, Any]]:
+        try:
+            data = self.gl.http_get(f"/projects/{project_id}/merge_requests/{mr_iid}/pipelines")
+            return data or []
+        except Exception:
+            return []
 
-        for i, file_path in enumerate(python_paths_filtered, 1):
-            if i % 100 == 0:
-                LOGGER.info("... analyzed %d/%d python files", i, len(python_paths_filtered))
+    def pipelines_on_ref(self, project, ref: str, since: datetime) -> List[Any]:
+        try:
+            return project.pipelines.list(ref=ref, updated_after=since.isoformat(), per_page=100, get_all=True)
+        except Exception:
+            return []
 
-            content = self.gl.get_file(project_id, file_path, ref=ref)
-            if content is None:
+    def pipeline_details(self, project, pipeline_id: int) -> Dict[str, Any]:
+        try:
+            p = project.pipelines.get(pipeline_id)
+            return {
+                "status": getattr(p, "status", None),
+                "coverage": getattr(p, "coverage", None),
+                "duration": getattr(p, "duration", None),
+                "created_at": getattr(p, "created_at", None),
+                "ref": getattr(p, "ref", None),
+            }
+        except Exception:
+            return {}
+
+    def user_events(self, user_id: int, since: datetime, until: datetime, action: Optional[str] = None) -> List[Dict[str, Any]]:
+        params = {"after": since.date().isoformat(), "before": until.date().isoformat(), "per_page": 100}
+        if action:
+            params["action"] = action
+        events = []
+        page = 1
+        while True:
+            params["page"] = page
+            batch = self.gl.http_get(f"/users/{user_id}/events", query_data=params) or []
+            if not batch:
+                break
+            events.extend(batch)
+            if len(batch) < 100:
+                break
+            page += 1
+        return events
+
+
+# ----------------------------
+# Snapshot scanning helpers
+# ----------------------------
+REQ_FILES = [
+    "requirements.txt",
+    "requirements-dev.txt",
+    "requirements_dev.txt",
+    "pyproject.toml",
+]
+CI_FILE = ".gitlab-ci.yml"
+IMPORT_LINE_RE = re.compile(r"^\s*(from\s+([A-Za-z_]\w*)\b|import\s+([A-Za-z_]\w*)\b)")
+
+
+@dataclass
+class SnapshotStats:
+    # 0/1 ints
+    has_ci_config: int = 0
+    has_configs: int = 0
+    has_docs: int = 0
+    has_notebooks_dir: int = 0
+    has_src: int = 0
+    has_tests: int = 0
+    has_tests_integration: int = 0
+    has_scripts_dir: int = 0
+    has_requirements_file: int = 0
+
+    notebooks_count: int = 0
+    scripts_count: int = 0
+    notebook_ratio: Optional[float] = None
+
+    # docstring coverage of functions
+    functions_total: int = 0
+    functions_with_docstring: int = 0
+    docstring_coverage_pct: Optional[float] = None
+
+    # Function Forge import share (imported symbols)
+    import_symbols_total: int = 0
+    forge_import_symbols: int = 0
+    forge_import_symbols_pct: Optional[float] = None
+
+
+def extract_python_sources_from_archive(
+    tar_bytes: bytes,
+    include_prefixes: Tuple[str, ...] = ("src/", "scripts/"),
+    exclude_prefixes: Tuple[str, ...] = ("tests/", "tests_integration/", ".venv/", "venv/", "dist/", "build/"),
+    max_files: int = 8000,
+    max_file_bytes: int = 2_000_000,
+) -> Dict[str, str]:
+    py_sources: Dict[str, str] = {}
+    with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:gz") as tf:
+        for m in tf.getmembers():
+            if len(py_sources) >= max_files:
+                break
+            if not m.isfile():
                 continue
-            if len(content.encode("utf-8", errors="ignore")) > self.max_file_bytes:
+            name = m.name
+            if not name.endswith(".py"):
+                continue
+            if m.size and m.size > max_file_bytes:
                 continue
 
-            f, f_doc, calls, ff_calls = self._analyze_python_source(content)
-            volume_functions += f
-            volume_functions_with_docstrings += f_doc
-            volume_calls += calls
-            volume_ff_calls += ff_calls
+            # Strip archive top folder
+            norm = name.split("/", 1)[1] if "/" in name else name
 
-        pct_doc = (100.0 * volume_functions_with_docstrings / volume_functions) if volume_functions else 0.0
-        pct_ff = (100.0 * volume_ff_calls / volume_calls) if volume_calls else 0.0
-        denom = (volume_notebooks + volume_scripts)
-        pct_scripts = (100.0 * volume_scripts / denom) if denom else 0.0
-
-        return RepoSnapshotMetrics(
-            has_configs=has_configs,
-            has_docs=has_docs,
-            has_notebooks=has_notebooks_folder,
-            has_requirements=has_requirements,
-            has_src=has_src,
-            has_tests=has_tests,
-            has_tests_integration=has_tests_integration,
-            volume_functions=volume_functions,
-            volume_functions_with_docstrings=volume_functions_with_docstrings,
-            pct_functions_with_docstrings=round(pct_doc, 2),
-            volume_function_calls=volume_calls,
-            volume_function_forge_calls=volume_ff_calls,
-            pct_function_forge_calls=round(pct_ff, 2),
-            volume_notebooks=volume_notebooks,
-            volume_scripts=volume_scripts,
-            pct_scripts_over_notebooks_plus_scripts=round(pct_scripts, 2),
-            latest_pipeline_coverage=None,  # filled elsewhere
-        )
-
-    def _filter_paths(self, paths: List[str]) -> List[str]:
-        """Exclude typical vendor/cache folders."""
-        out = []
-        for p in paths:
-            pl = p.lower()
-            if any(pl.startswith(d + "/") for d in self.exclude_dirs):
+            if include_prefixes and not any(norm.startswith(p) for p in include_prefixes):
                 continue
-            out.append(p)
-        return out
+            if exclude_prefixes and any(norm.startswith(p) for p in exclude_prefixes):
+                continue
 
-    def _analyze_python_source(self, src: str) -> Tuple[int, int, int, int]:
-        """
-        AST-based metrics:
-        - number of functions
-        - number of functions with docstrings
-        - number of function calls
-        - number of calls attributable to function_forge (best-effort via imports)
-        """
-        import ast
+            f = tf.extractfile(m)
+            if not f:
+                continue
+            try:
+                src = f.read().decode("utf-8", errors="replace")
+            except Exception:
+                continue
+            py_sources[norm] = src
+    return py_sources
 
+
+def scan_snapshot(tar_bytes: bytes, forge_prefixes: List[str]) -> SnapshotStats:
+    st = SnapshotStats()
+    forge_prefixes = [p.strip() for p in forge_prefixes if p.strip()]
+
+    with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:gz") as tf:
+        for m in tf.getmembers():
+            if not m.isfile():
+                continue
+            name = m.name
+            norm = name.split("/", 1)[1] if "/" in name else name
+
+            if norm == CI_FILE:
+                st.has_ci_config = 1
+            if norm.startswith("configs/"):
+                st.has_configs = 1
+            if norm.startswith("docs/"):
+                st.has_docs = 1
+            if norm.startswith("notebooks/"):
+                st.has_notebooks_dir = 1
+            if norm.startswith("src/"):
+                st.has_src = 1
+            if norm.startswith("tests/"):
+                st.has_tests = 1
+            if norm.startswith("tests_integration/"):
+                st.has_tests_integration = 1
+            if norm.startswith("scripts/"):
+                st.has_scripts_dir = 1
+            if any(norm == rf for rf in REQ_FILES):
+                st.has_requirements_file = 1
+
+            if norm.endswith(".ipynb"):
+                st.notebooks_count += 1
+            if norm.startswith("scripts/") and norm.endswith(".py"):
+                st.scripts_count += 1
+
+    denom = st.notebooks_count + st.scripts_count
+    st.notebook_ratio = (st.notebooks_count / denom) if denom > 0 else None
+
+    # AST for docstring coverage + import share
+    py_sources = extract_python_sources_from_archive(tar_bytes, include_prefixes=("src/", "scripts/"))
+
+    import_symbols_total = 0
+    forge_symbols = 0
+    fn_total = 0
+    fn_doc = 0
+
+    for _, src in py_sources.items():
         try:
             tree = ast.parse(src)
-        except SyntaxError:
-            return 0, 0, 0, 0
+        except Exception:
+            continue
 
-        function_defs: List[ast.AST] = []
-        for node in ast.walk(tree):
+        for node in tree.body:
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                function_defs.append(node)
-
-        functions = len(function_defs)
-        functions_with_doc = 0
-        for fn in function_defs:
-            doc = ast.get_docstring(fn)  # type: ignore[arg-type]
-            if doc:
-                functions_with_doc += 1
-
-        # import map for function_forge
-        module_aliases: set[str] = set()
-        imported_funcs: set[str] = set()
-
+                fn_total += 1
+                if ast.get_docstring(node, clean=False) is not None:
+                    fn_doc += 1
+          
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 for alias in node.names:
-                    if alias.name in self.function_forge_names:
-                        module_aliases.add(alias.asname or alias.name)
+                    import_symbols_total += 1
+                    top = (alias.name or "").split(".", 1)[0]
+                    if top in forge_prefixes:
+                        forge_symbols += 1
             elif isinstance(node, ast.ImportFrom):
-                if node.module and node.module in self.function_forge_names:
-                    for alias in node.names:
-                        imported_funcs.add(alias.asname or alias.name)
+                mod = node.module or ""
+                top = mod.split(".", 1)[0] if mod else ""
+                for _alias in node.names:
+                    import_symbols_total += 1
+                    if top in forge_prefixes:
+                        forge_symbols += 1
 
-        calls = 0
-        ff_calls = 0
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Call):
-                calls += 1
-                # module alias call: ff.something(...)
-                if isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name):
-                    if node.func.value.id in module_aliases:
-                        ff_calls += 1
-                # direct imported function call: foo(...)
-                elif isinstance(node.func, ast.Name):
-                    if node.func.id in imported_funcs:
-                        ff_calls += 1
+    st.functions_total = fn_total
+    st.functions_with_docstring = fn_doc
+    st.docstring_coverage_pct = (100.0 * fn_doc / fn_total) if fn_total > 0 else None
 
-        return functions, functions_with_doc, calls, ff_calls
+    st.import_symbols_total = import_symbols_total
+    st.forge_import_symbols = forge_symbols
+    st.forge_import_symbols_pct = (100.0 * forge_symbols / import_symbols_total) if import_symbols_total > 0 else None
+
+    return st
 
 
-# -----------------------------
-# Metrics extraction
-# -----------------------------
+# ----------------------------
+# MR diff contributions + MR pipeline attribution
+# ----------------------------
+TRIPLE_RE = re.compile(r"'''|\"\"\"")
 
-def safe_mean(xs: List[float]) -> Optional[float]:
-    """Compute mean with None when empty."""
-    if not xs:
+
+@dataclass
+class DiffContribAcc:
+    added_docstring_lines: int = 0
+    test_files_touched: int = 0
+    test_lines_added: int = 0
+
+    notebooks_added_files: int = 0
+    notebooks_deleted_files: int = 0
+
+    files_touched_py: int = 0
+    import_total_added: int = 0
+    forge_imports_added: int = 0
+    forge_files_hit: int = 0
+
+    # CI (MR pipeline) attribution
+    mr_pipelines_total: int = 0
+    mr_pipelines_success: int = 0
+    mr_pipelines_failed: int = 0
+    mr_pipelines_canceled: int = 0
+    mrs_merged_with_mr_pipeline: int = 0
+    mr_pipeline_durations: List[float] = None
+    mr_pipeline_coverages: List[float] = None
+
+    def __post_init__(self):
+        if self.mr_pipeline_durations is None:
+            self.mr_pipeline_durations = []
+        if self.mr_pipeline_coverages is None:
+            self.mr_pipeline_coverages = []
+
+
+def analyze_added_lines(lines: List[str], forge_prefixes: List[str]) -> Tuple[int, int, int]:
+    """
+    Returns: added_docstring_lines, import_total, forge_imports
+    Docstring is heuristic from triple quotes toggling in added lines.
+    """
+    forge_prefixes = [p.strip() for p in forge_prefixes if p.strip()]
+
+    doc_lines = 0
+    import_total = 0
+    forge_imports = 0
+    in_doc = False
+
+    for ln in lines:
+        if not ln.strip():
+            continue
+
+        if TRIPLE_RE.search(ln):
+            doc_lines += 1
+            in_doc = not in_doc
+        elif in_doc:
+            doc_lines += 1
+
+        m = IMPORT_LINE_RE.match(ln)
+        if m:
+            import_total += 1
+            top = m.group(2) or m.group(3) or ""
+            if top in forge_prefixes:
+                forge_imports += 1
+
+    return doc_lines, import_total, forge_imports
+
+
+def compute_diff_contrib(changes_payload: Dict[str, Any], forge_prefixes: List[str]) -> DiffContribAcc:
+    acc = DiffContribAcc()
+    changes = changes_payload.get("changes") or []
+
+    for ch in changes:
+        path = ch.get("new_path") or ch.get("old_path") or ""
+        new_file = bool(ch.get("new_file"))
+        deleted_file = bool(ch.get("deleted_file"))
+
+        if path.endswith(".ipynb"):
+            if new_file:
+                acc.notebooks_added_files += 1
+            if deleted_file:
+                acc.notebooks_deleted_files += 1
+
+        is_test = path.startswith("tests/") or path.startswith("tests_integration/")
+        if is_test:
+            acc.test_files_touched += 1
+
+        diff = ch.get("diff") or ""
+        if not diff:
+            continue
+
+        if not path.endswith(".py"):
+            continue
+
+        added_lines = []
+        for line in diff.splitlines():
+            if line.startswith("+++ ") or line.startswith("--- ") or line.startswith("@@"):
+                continue
+            if line.startswith("+") and not line.startswith("++"):
+                added_lines.append(line[1:])
+
+        if not added_lines:
+            continue
+
+        acc.files_touched_py += 1
+
+        doc_lines, import_total, forge_imports = analyze_added_lines(added_lines, forge_prefixes)
+        acc.added_docstring_lines += doc_lines
+        acc.import_total_added += import_total
+        acc.forge_imports_added += forge_imports
+        if forge_imports > 0:
+            acc.forge_files_hit += 1
+
+        if is_test:
+            nonblank = sum(1 for ln in added_lines if ln.strip())
+            acc.test_lines_added += nonblank
+
+    return acc
+
+
+def diff_forge_reuse_score(acc: DiffContribAcc) -> Optional[float]:
+    """0-100 score based on file hit % and import statement share in added lines."""
+    if acc.files_touched_py <= 0:
         return None
-    return sum(xs) / len(xs)
+    file_pct = acc.forge_files_hit / acc.files_touched_py
+    stmt_pct = (acc.forge_imports_added / acc.import_total_added) if acc.import_total_added > 0 else 0.0
+    return 100.0 * (0.5 * file_pct + 0.5 * stmt_pct)
 
 
-def project_monthly_metrics(
-    gl: GitLabClient,
-    project: Dict[str, Any],
-    month_start: dt.date,
-    month_end: dt.date,
-) -> Tuple[MonthlyProjectMetrics, Dict[int, MonthlyUserMetrics]]:
-    """
-    Compute monthly project metrics + accumulate per-user metrics from merged MRs.
-    Returns:
-      - MonthlyProjectMetrics
-      - dict[user_id] -> MonthlyUserMetrics (partial; aggregated by caller across projects)
-    """
-    project_id = project["id"]
-    project_path = project.get("path_with_namespace", project.get("path", str(project_id)))
-
-    start_iso, end_iso = iso_datetime_range(month_start, month_end)
-
-    # Pipelines
-    pipelines = gl.list_pipelines(project_id, ref=None, updated_after=start_iso, updated_before=end_iso)
-    coverages: List[float] = []
-    for p in pipelines[:200]:  # guard rails
-        pid = p.get("id")
-        if pid is None:
-            continue
-        try:
-            pfull = gl.get_pipeline(project_id, int(pid))
-            cov = pfull.get("coverage")
-            if cov is not None:
-                try:
-                    coverages.append(float(cov))
-                except Exception:
-                    pass
-        except Exception:
-            continue
-
-    avg_cov = safe_mean(coverages)
-
-    # MRs merged in month
-    merged_mrs = gl.list_merge_requests_merged_in_range(project_id, merged_after=start_iso, merged_before=end_iso)
-
-    time_to_merge_hours: List[float] = []
-    mr_commits_counts: List[float] = []
-
-    net_notebooks = 0
-    net_scripts = 0
-    net_docstrings = 0
-    net_tests_files_added = 0
-    net_ff_imports_added = 0
-
-    user_bucket: Dict[int, MonthlyUserMetrics] = {}
-
-    for mr in merged_mrs:
-        mr_iid = mr.get("iid")
-        if mr_iid is None:
-            continue
-
-        created_at = parse_gitlab_dt(mr.get("created_at", ""))
-        merged_at = parse_gitlab_dt(mr.get("merged_at", ""))
-        if created_at and merged_at:
-            delta_h = (merged_at - created_at).total_seconds() / 3600.0
-            if delta_h >= 0:
-                time_to_merge_hours.append(delta_h)
-
-        # commits in MR (proxy)
-        try:
-            commits = gl.list_mr_commits(project_id, int(mr_iid))
-            mr_commits_counts.append(float(len(commits)))
-        except Exception:
-            pass
-
-        # Notes (comments) for user metrics
-        try:
-            notes = gl.list_mr_notes(project_id, int(mr_iid))
-        except Exception:
-            notes = []
-
-        # Changes/diffs for contribution signals
-        try:
-            changes = gl.get_mr_changes(project_id, int(mr_iid))
-            change_list = changes.get("changes", []) or []
-        except Exception:
-            change_list = []
-
-        # Identify author
-        author = mr.get("author") or {}
-        user_id = author.get("id")
-        if user_id is None:
-            continue
-
-        if user_id not in user_bucket:
-            user_bucket[user_id] = MonthlyUserMetrics(
-                user_id=int(user_id),
-                user_name=author.get("name", ""),
-                user_username=author.get("username", ""),
-                month_start=str(month_start),
-                month_end=str(month_end),
-                commits_count=0,            # filled later via commits endpoint (caller)
-                mrs_authored_count=0,
-                comments_count=0,
-                notebooks_reduced=0,
-                docstrings_added=0,
-                tests_added=0,
-                function_forge_added=0,
-            )
-
-        user_bucket[user_id].mrs_authored_count += 1
-
-        # Count comments by author in this MR (notes)
-        for n in notes:
-            na = n.get("author") or {}
-            nid = na.get("id")
-            if nid is None:
-                continue
-            if nid not in user_bucket:
-                user_bucket[nid] = MonthlyUserMetrics(
-                    user_id=int(nid),
-                    user_name=na.get("name", ""),
-                    user_username=na.get("username", ""),
-                    month_start=str(month_start),
-                    month_end=str(month_end),
-                    commits_count=0,
-                    mrs_authored_count=0,
-                    comments_count=0,
-                    notebooks_reduced=0,
-                    docstrings_added=0,
-                    tests_added=0,
-                    function_forge_added=0,
-                )
-            user_bucket[nid].comments_count += 1
-
-        # Diff-based contribution heuristics
-        for ch in change_list:
-            new_path = (ch.get("new_path") or ch.get("old_path") or "").strip()
-            old_path = (ch.get("old_path") or "").strip()
-            deleted = bool(ch.get("deleted_file"))
-            new_file = bool(ch.get("new_file"))
-            patch = ch.get("diff") or ""
-
-            path = new_path or old_path
-            pl = path.lower()
-
-            # notebooks net
-            if pl.endswith(".ipynb"):
-                if new_file:
-                    net_notebooks += 1
-                if deleted:
-                    net_notebooks -= 1
-
-            # scripts net
-            if classify_script_path(path):
-                if new_file:
-                    net_scripts += 1
-                if deleted:
-                    net_scripts -= 1
-
-            # tests files added
-            if new_file and (pl.startswith("tests/") or pl.startswith("test/") or pl.startswith("tests_integration/")):
-                net_tests_files_added += 1
-
-            # docstring additions (approx)
-            ds_added = count_docstring_additions_in_patch(patch)
-            net_docstrings += ds_added
-
-            # function_forge imports added
-            ff_added = count_function_forge_imports_added(patch)
-            net_ff_imports_added += ff_added
-
-            # Update author contribution bucket (only attribute “improvements” to author)
-            # Notebook reduction: count deletions of ipynb as reduction signal
-            if pl.endswith(".ipynb") and deleted:
-                user_bucket[user_id].notebooks_reduced += 1
-            user_bucket[user_id].docstrings_added += ds_added
-            user_bucket[user_id].tests_added += int(new_file and (pl.startswith("tests/") or pl.startswith("test/") or pl.startswith("tests_integration/")))
-            user_bucket[user_id].function_forge_added += ff_added
-
-    metrics = MonthlyProjectMetrics(
-        project_id=int(project_id),
-        project_path=str(project_path),
-        month_start=str(month_start),
-        month_end=str(month_end),
-        pipelines_count=len(pipelines),
-        avg_pipeline_coverage=(round(avg_cov, 2) if avg_cov is not None else None),
-        merged_mrs_count=len(merged_mrs),
-        avg_time_to_merge_hours=(round(safe_mean(time_to_merge_hours), 2) if time_to_merge_hours else None),
-        avg_mr_commits=(round(safe_mean(mr_commits_counts), 2) if mr_commits_counts else None),
-        net_notebooks=net_notebooks,
-        net_scripts=net_scripts,
-        net_docstring_additions=net_docstrings,
-        net_tests_files_added=net_tests_files_added,
-        net_function_forge_imports_added=net_ff_imports_added,
-    )
-    return metrics, user_bucket
+def pipeline_bucket_status(status: Optional[str]) -> str:
+    if status == "success":
+        return "success"
+    if status == "failed":
+        return "failed"
+    if status == "canceled":
+        return "canceled"
+    return "other"
 
 
-def fill_user_commit_counts(
-    gl: GitLabClient,
-    projects: List[Dict[str, Any]],
-    user_metrics: Dict[int, MonthlyUserMetrics],
-    start_iso: str,
-    end_iso: str,
-) -> None:
-    """
-    Fill commits_count for users in the bucket.
-    Best-effort: GitLab commit endpoint supports author filtering by string.
-    We use username as author filter when available.
-    """
-    # index username -> user_id
-    user_by_username = {um.user_username: uid for uid, um in user_metrics.items() if um.user_username}
-
-    if not user_by_username:
-        return
-
-    for proj in projects:
-        pid = proj["id"]
-        for username, uid in user_by_username.items():
-            try:
-                commits = gl.list_commits(pid, since=start_iso, until=end_iso, author=username)
-                user_metrics[uid].commits_count += len(commits)
-            except Exception:
-                continue
-
-
-# -----------------------------
-# Writers
-# -----------------------------
-
-def write_csv(path: str, rows: List[Dict[str, Any]]) -> None:
-    """Write list of dicts to CSV."""
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    if not rows:
-        LOGGER.warning("No rows to write: %s", path)
-        return
-    fieldnames = sorted({k for r in rows for k in r.keys()})
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames)
-        w.writeheader()
-        for r in rows:
-            w.writerow(r)
-
-
-def write_json(path: str, obj: Any) -> None:
-    """Write JSON safely."""
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(obj, f, indent=2, ensure_ascii=False)
-
-
-# -----------------------------
+# ----------------------------
 # Main
-# -----------------------------
-
+# ----------------------------
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Track MLOps adoption on GitLab (project, workspace, user).")
-    parser.add_argument("--base-url", required=True, help="GitLab base URL, e.g. https://gitlab.example.com")
-    parser.add_argument("--token", required=True, help="GitLab personal access token (API scope)")
-    parser.add_argument("--group-id", type=int, required=True, help="Workspace / group ID")
-    parser.add_argument("--outdir", default="./out", help="Output directory")
-    parser.add_argument("--months", type=int, default=3, help="Number of last full months to report (default 3)")
-    parser.add_argument("--log-level", default="INFO", help="Logging level: DEBUG, INFO, WARNING, ERROR")
-    parser.add_argument("--function-forge-names", default="function_forge",
-                        help="Comma-separated module names to treat as function_forge (e.g. function_forge,function-forge)")
-    parser.add_argument("--exclude-dirs", default="venv,.venv,.git,dist,build,__pycache__,.mypy_cache,.ruff_cache",
-                        help="Comma-separated directory prefixes to exclude from analysis")
-    parser.add_argument("--max-python-files", type=int, default=1500, help="Max python files analyzed per project")
-    parser.add_argument("--default-ref", default="", help="Override ref (branch/tag). Default: project default branch")
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--group", required=True, help="GitLab group path, e.g. gcqa/mlops")
+    ap.add_argument("--since", required=True, help="ISO datetime, e.g. 2026-01-01T00:00:00Z")
+    ap.add_argument("--until", required=True, help="ISO datetime, e.g. 2026-12-31T23:59:59Z")
+    ap.add_argument("--outdir", default="out", help="Output directory for CSVs")
+    ap.add_argument("--include-subgroups", action="store_true", default=True)
+    ap.add_argument("--forge-prefixes", default="function_forge",
+                    help="Comma-separated top-level import names for Function Forge (default: function_forge)")
+    ap.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    ap.add_argument("--max-projects", type=int, default=10_000, help="Safety limit on number of projects processed")
+    ap.add_argument("--max-mrs-per-project", type=int, default=50_000,
+                    help="Safety limit on MRs pulled per project (updated_after filter still applies)")
+    args = ap.parse_args()
 
-    setup_logger(args.log_level)
+    logging.basicConfig(level=getattr(logging, args.log_level), format="%(asctime)s %(levelname)s %(message)s")
 
-    gl = GitLabClient(base_url=args.base_url, token=args.token)
-    analyzer = RepoAnalyzer(
-        gl=gl,
-        function_forge_names=args.function_forge_names.split(","),
-        max_python_files=args.max_python_files,
-        exclude_dirs=args.exclude_dirs.split(","),
-    )
-
-    outdir = args.outdir
-    os.makedirs(outdir, exist_ok=True)
-
-    # Load projects
-    projects = gl.list_group_projects(args.group_id)
-    if not projects:
-        LOGGER.error("No projects found for group_id=%s", args.group_id)
+    url = os.getenv("GITLAB_URL")
+    token = os.getenv("GITLAB_TOKEN")
+    if not url or not token:
+        LOG.error("Set GITLAB_URL and GITLAB_TOKEN env vars.")
         return 2
 
-    # -----------------------------
-    # 1) Current snapshot (per project + workspace aggregate)
-    # -----------------------------
-    snapshot_rows: List[Dict[str, Any]] = []
-    workspace_agg: Dict[str, float] = {
-        "n_projects": 0,
-        "has_configs_sum": 0,
-        "has_docs_sum": 0,
-        "has_notebooks_sum": 0,
-        "has_requirements_sum": 0,
-        "has_src_sum": 0,
-        "has_tests_sum": 0,
-        "has_tests_integration_sum": 0,
-        "volume_functions_sum": 0,
-        "volume_functions_with_docstrings_sum": 0,
-        "volume_function_calls_sum": 0,
-        "volume_function_forge_calls_sum": 0,
-        "volume_notebooks_sum": 0,
-        "volume_scripts_sum": 0,
-    }
+    since = parse_dt(args.since)
+    until = parse_dt(args.until)
+    if not since or not until or until < since:
+        LOG.error("Invalid since/until.")
+        return 2
 
-    LOGGER.info("Computing CURRENT snapshot metrics for %d projects", len(projects))
-    for proj in projects:
-        pid = proj["id"]
-        ppath = proj.get("path_with_namespace", proj.get("path", str(pid)))
+    forge_prefixes = [x.strip() for x in args.forge_prefixes.split(",") if x.strip()]
+    month_windows = iter_month_windows(since, until)
+    months = [m for (m, _, _) in month_windows]
 
-        try:
-            default_branch = args.default_ref or proj.get("default_branch") or "main"
-            snap = analyzer.snapshot_metrics(pid, ref=default_branch)
+    gl = GL(url, token)
 
-            # Latest pipeline coverage on default branch (best effort)
-            today = dt.date.today()
-            # look back 30 days for "latest"
-            start_iso, end_iso = iso_datetime_range(today - dt.timedelta(days=30), today)
-            pipelines = gl.list_pipelines(pid, ref=default_branch, updated_after=start_iso, updated_before=end_iso)
-            latest_cov = None
-            for p in pipelines[:10]:
-                try:
-                    pf = gl.get_pipeline(pid, int(p["id"]))
-                    cov = pf.get("coverage")
-                    if cov is not None:
-                        latest_cov = float(cov)
-                        break
-                except Exception:
+    LOG.info("Loading group projects and members...")
+    projects = gl.group_projects(args.group, include_subgroups=args.include_subgroups)[: args.max_projects]
+    members = gl.group_members(args.group)
+    LOG.info("Found %d projects, %d members", len(projects), len(members))
+
+    # ----------------------------
+    # Seed rows
+    # ----------------------------
+    project_rows: Dict[Tuple[int, str], Dict[str, Any]] = {}
+    for p in projects:
+        for (m, _, _) in month_windows:
+            project_rows[(p.id, m)] = {
+                "month": m,
+                "project_id": p.id,
+                "project": getattr(p, "path_with_namespace", ""),
+                "default_branch": getattr(p, "default_branch", "") or "main",
+
+                # snapshot structure (0/1) + success flag
+                "snapshot_ok": 0,
+                "has_ci_config": 0,
+                "has_configs": 0,
+                "has_docs": 0,
+                "has_notebooks_dir": 0,
+                "has_src": 0,
+                "has_tests": 0,
+                "has_tests_integration": 0,
+                "has_scripts_dir": 0,
+                "has_requirements_file": 0,
+
+                # snapshot content metrics
+                "functions_total": None,
+                "functions_with_docstring": None,
+                "docstring_coverage_pct": None,
+                "forge_import_symbols_pct": None,
+                "notebooks_count": None,
+                "scripts_count": None,
+                "notebook_ratio": None,
+
+                # activity volumes
+                "mrs_created": 0,
+                "mrs_merged": 0,
+                "mr_notes_total": 0,
+
+                # MR close metrics
+                "mrs_closed": 0,
+                "mr_time_to_close_hours_median": None,
+                "mr_time_to_close_hours_mean": None,
+
+                # CI usage: default branch pipelines
+                "default_branch_pipelines_total": 0,
+                "default_branch_pipelines_success": 0,
+                "default_branch_pipelines_failed": 0,
+                "default_branch_pipelines_canceled": 0,
+                "default_branch_pipeline_success_rate": None,
+                "default_branch_pipeline_duration_median_seconds": None,
+                "default_branch_pipeline_duration_mean_seconds": None,
+                "default_branch_pipeline_coverage_median": None,
+                "default_branch_pipeline_coverage_mean": None,
+
+                # MR diff contributions aggregated for project
+                "mr_added_docstring_lines": 0,
+                "mr_test_files_touched": 0,
+                "mr_test_lines_added": 0,
+                "mr_notebooks_added_files": 0,
+                "mr_notebooks_deleted_files": 0,
+                "mr_notebooks_net_files": 0,
+                "mr_forge_reuse_score": None,
+
+                # CI usage: MR pipelines (attributed to merge month)
+                "mr_pipelines_total": 0,
+                "mr_pipelines_success": 0,
+                "mr_pipelines_failed": 0,
+                "mr_pipelines_canceled": 0,
+                "mr_pipeline_success_rate": None,
+                "mrs_merged_with_mr_pipeline": 0,
+                "mr_pipeline_adoption_rate": None,
+                "mr_pipeline_duration_median_seconds": None,
+                "mr_pipeline_duration_mean_seconds": None,
+                "mr_pipeline_coverage_median": None,
+                "mr_pipeline_coverage_mean": None,
+            }
+
+    user_rows: Dict[Tuple[int, str], Dict[str, Any]] = {}
+    for (uid, username, name) in members:
+        for (m, _, _) in month_windows:
+            user_rows[(uid, m)] = {
+                "month": m,
+                "user_id": uid,
+                "username": username,
+                "name": name,
+
+                # volumes
+                "commits_estimated": 0,
+                "mrs_created": 0,
+                "mrs_merged": 0,
+                "mr_notes_written": 0,  # strict: MR notes authored
+                "comment_events": 0,    # broad: events action=commented
+
+                # MR close metrics
+                "mrs_closed": 0,
+                "mr_time_to_close_hours_median": None,
+                "mr_time_to_close_hours_mean": None,
+
+                # MR diff contributions (for merged MRs)
+                "mr_added_docstring_lines": 0,
+                "mr_test_files_touched": 0,
+                "mr_test_lines_added": 0,
+                "mr_notebooks_added_files": 0,
+                "mr_notebooks_deleted_files": 0,
+                "mr_notebooks_net_files": 0,
+                "mr_forge_reuse_score": None,
+
+                # CI usage: MR pipelines attributed to merged MRs
+                "mr_pipelines_total": 0,
+                "mr_pipelines_success": 0,
+                "mr_pipelines_failed": 0,
+                "mr_pipelines_canceled": 0,
+                "mr_pipeline_success_rate": None,
+                "mrs_merged_with_mr_pipeline": 0,
+                "mr_pipeline_adoption_rate": None,
+                "mr_pipeline_duration_median_seconds": None,
+                "mr_pipeline_duration_mean_seconds": None,
+                "mr_pipeline_coverage_mean": None,
+            }
+
+    diff_acc_proj: Dict[Tuple[int, str], DiffContribAcc] = {}
+    diff_acc_user: Dict[Tuple[int, str], DiffContribAcc] = {}
+
+    close_times_proj: Dict[Tuple[int, str], List[float]] = {}
+    close_times_user: Dict[Tuple[int, str], List[float]] = {}
+
+    # ----------------------------
+    # User events volumes
+    # ----------------------------
+    LOG.info("Collecting user events for commit/comment volumes...")
+    for (uid, _, _) in members:
+        pushed = gl.user_events(uid, since, until, action="pushed")
+        for ev in pushed:
+            t = parse_dt(ev.get("created_at"))
+            if not t:
+                continue
+            mk = month_key(t)
+            if (uid, mk) not in user_rows:
+                continue
+            push_data = ev.get("push_data") or {}
+            cc = push_data.get("commit_count")
+            if isinstance(cc, int):
+                user_rows[(uid, mk)]["commits_estimated"] += cc
+
+        commented = gl.user_events(uid, since, until, action="commented")
+        for ev in commented:
+            t = parse_dt(ev.get("created_at"))
+            if not t:
+                continue
+            mk = month_key(t)
+            if (uid, mk) in user_rows:
+                user_rows[(uid, mk)]["comment_events"] += 1
+
+    # ----------------------------
+    # Per-project: MRs, notes, close time, MR diffs + MR pipeline CI attribution
+    # ----------------------------
+    LOG.info("Collecting MR volumes, notes, close time, MR diff contributions, and MR pipeline CI attribution...")
+    for idx, project in enumerate(projects, start=1):
+        pid = project.id
+        pname = getattr(project, "path_with_namespace", str(pid))
+        LOG.info("[%d/%d] Project %s", idx, len(projects), pname)
+
+        mrs = gl.mrs_updated_after(project, since)[: args.max_mrs_per_project]
+        LOG.info("  MRs pulled: %d (updated after %s)", len(mrs), since.date().isoformat())
+
+        for mr in mrs:
+            author = (getattr(mr, "author", {}) or {})
+            author_id = author.get("id")
+            mr_iid = mr.iid
+            state = getattr(mr, "state", None)
+
+            created_at = parse_dt(getattr(mr, "created_at", None))
+            merged_at = parse_dt(getattr(mr, "merged_at", None))
+            closed_at = parse_dt(getattr(mr, "closed_at", None))
+
+            # Created volume
+            if created_at:
+                mk = month_key(created_at)
+                if (pid, mk) in project_rows:
+                    project_rows[(pid, mk)]["mrs_created"] += 1
+                if author_id and (author_id, mk) in user_rows:
+                    user_rows[(author_id, mk)]["mrs_created"] += 1
+
+            # Merged volume
+            merged_month = None
+            if state == "merged" and merged_at:
+                mk = month_key(merged_at)
+                if (pid, mk) in project_rows:
+                    project_rows[(pid, mk)]["mrs_merged"] += 1
+                if author_id and (author_id, mk) in user_rows:
+                    user_rows[(author_id, mk)]["mrs_merged"] += 1
+                merged_month = mk
+
+            # Time to close (merged or closed), bucket by close timestamp month
+            close_ts = None
+            if state == "merged" and merged_at:
+                close_ts = merged_at
+            elif state == "closed" and closed_at:
+                close_ts = closed_at
+
+            if created_at and close_ts:
+                mk = month_key(close_ts)
+                hrs = (close_ts - created_at).total_seconds() / 3600.0
+                if (pid, mk) in project_rows:
+                    project_rows[(pid, mk)]["mrs_closed"] += 1
+                    close_times_proj.setdefault((pid, mk), []).append(hrs)
+                if author_id and (author_id, mk) in user_rows:
+                    user_rows[(author_id, mk)]["mrs_closed"] += 1
+                    close_times_user.setdefault((author_id, mk), []).append(hrs)
+
+            # Notes volume
+            notes = gl.mr_notes(mr)
+            for n in notes:
+                if getattr(n, "system", False):
+                    continue
+                nt = parse_dt(getattr(n, "created_at", None))
+                if not nt:
+                    continue
+                mk = month_key(nt)
+                if (pid, mk) in project_rows:
+                    project_rows[(pid, mk)]["mr_notes_total"] += 1
+
+                na = (getattr(n, "author", {}) or {}).get("id")
+                if na and (na, mk) in user_rows:
+                    user_rows[(na, mk)]["mr_notes_written"] += 1
+
+            # MR diff contributions + MR pipeline CI (only for merged MRs)
+            if merged_month and author_id and (pid, merged_month) in project_rows and (author_id, merged_month) in user_rows:
+                # Diff contribution
+                changes = gl.mr_changes(pid, mr_iid)
+                if changes:
+                    acc = compute_diff_contrib(changes, forge_prefixes)
+                    diff_acc_proj.setdefault((pid, merged_month), DiffContribAcc())
+                    diff_acc_user.setdefault((author_id, merged_month), DiffContribAcc())
+
+                    for dst in (diff_acc_proj[(pid, merged_month)], diff_acc_user[(author_id, merged_month)]):
+                        dst.added_docstring_lines += acc.added_docstring_lines
+                        dst.test_files_touched += acc.test_files_touched
+                        dst.test_lines_added += acc.test_lines_added
+                        dst.notebooks_added_files += acc.notebooks_added_files
+                        dst.notebooks_deleted_files += acc.notebooks_deleted_files
+                        dst.files_touched_py += acc.files_touched_py
+                        dst.import_total_added += acc.import_total_added
+                        dst.forge_imports_added += acc.forge_imports_added
+                        dst.forge_files_hit += acc.forge_files_hit
+
+                # MR pipeline attribution (latest MR pipeline)
+                mr_pipes = gl.mr_pipelines(pid, mr_iid)
+                if mr_pipes:
+                    mr_pipes_sorted = sorted(
+                        mr_pipes,
+                        key=lambda x: parse_dt(x.get("created_at")) or datetime.min.replace(tzinfo=timezone.utc),
+                        reverse=True,
+                    )
+                    chosen = mr_pipes_sorted[0]
+                    pipeline_id = chosen.get("id")
+                    if pipeline_id:
+                        details = gl.pipeline_details(project, int(pipeline_id))
+                        status = pipeline_bucket_status(details.get("status"))
+                        duration = details.get("duration")
+                        coverage = details.get("coverage")
+
+                        for dst in (diff_acc_proj.setdefault((pid, merged_month), DiffContribAcc()),
+                                    diff_acc_user.setdefault((author_id, merged_month), DiffContribAcc())):
+                            dst.mr_pipelines_total += 1
+                            dst.mrs_merged_with_mr_pipeline += 1
+
+                            if status == "success":
+                                dst.mr_pipelines_success += 1
+                            elif status == "failed":
+                                dst.mr_pipelines_failed += 1
+                            elif status == "canceled":
+                                dst.mr_pipelines_canceled += 1
+
+                            if isinstance(duration, (int, float)):
+                                dst.mr_pipeline_durations.append(float(duration))
+                            try:
+                                if coverage is not None:
+                                    dst.mr_pipeline_coverages.append(float(coverage))
+                            except Exception:
+                                pass
+
+    # Close-time finalization
+    LOG.info("Finalizing MR close-time metrics...")
+    for (pid, mk), vals in close_times_proj.items():
+        project_rows[(pid, mk)]["mr_time_to_close_hours_median"] = safe_median(vals)
+        project_rows[(pid, mk)]["mr_time_to_close_hours_mean"] = safe_mean(vals)
+
+    for (uid, mk), vals in close_times_user.items():
+        user_rows[(uid, mk)]["mr_time_to_close_hours_median"] = safe_median(vals)
+        user_rows[(uid, mk)]["mr_time_to_close_hours_mean"] = safe_mean(vals)
+
+    # Diff aggregates + MR pipeline stats into rows
+    LOG.info("Finalizing diff-based contribution metrics and MR pipeline CI stats...")
+    for (pid, mk), acc in diff_acc_proj.items():
+        row = project_rows[(pid, mk)]
+        row["mr_added_docstring_lines"] = acc.added_docstring_lines
+        row["mr_test_files_touched"] = acc.test_files_touched
+        row["mr_test_lines_added"] = acc.test_lines_added
+        row["mr_notebooks_added_files"] = acc.notebooks_added_files
+        row["mr_notebooks_deleted_files"] = acc.notebooks_deleted_files
+        row["mr_notebooks_net_files"] = acc.notebooks_added_files - acc.notebooks_deleted_files
+        row["mr_forge_reuse_score"] = diff_forge_reuse_score(acc)
+
+        row["mr_pipelines_total"] = acc.mr_pipelines_total
+        row["mr_pipelines_success"] = acc.mr_pipelines_success
+        row["mr_pipelines_failed"] = acc.mr_pipelines_failed
+        row["mr_pipelines_canceled"] = acc.mr_pipelines_canceled
+        row["mrs_merged_with_mr_pipeline"] = acc.mrs_merged_with_mr_pipeline
+        row["mr_pipeline_success_rate"] = (acc.mr_pipelines_success / acc.mr_pipelines_total) if acc.mr_pipelines_total else None
+        merged = row["mrs_merged"]
+        row["mr_pipeline_adoption_rate"] = (acc.mrs_merged_with_mr_pipeline / merged) if merged else None
+        row["mr_pipeline_duration_median_seconds"] = safe_median(acc.mr_pipeline_durations)
+        row["mr_pipeline_duration_mean_seconds"] = safe_mean(acc.mr_pipeline_durations)
+        row["mr_pipeline_coverage_median"] = safe_median(acc.mr_pipeline_coverages)
+        row["mr_pipeline_coverage_mean"] = safe_mean(acc.mr_pipeline_coverages)
+
+    for (uid, mk), acc in diff_acc_user.items():
+        row = user_rows[(uid, mk)]
+        row["mr_added_docstring_lines"] = acc.added_docstring_lines
+        row["mr_test_files_touched"] = acc.test_files_touched
+        row["mr_test_lines_added"] = acc.test_lines_added
+        row["mr_notebooks_added_files"] = acc.notebooks_added_files
+        row["mr_notebooks_deleted_files"] = acc.notebooks_deleted_files
+        row["mr_notebooks_net_files"] = acc.notebooks_added_files - acc.notebooks_deleted_files
+        row["mr_forge_reuse_score"] = diff_forge_reuse_score(acc)
+
+        row["mr_pipelines_total"] = acc.mr_pipelines_total
+        row["mr_pipelines_success"] = acc.mr_pipelines_success
+        row["mr_pipelines_failed"] = acc.mr_pipelines_failed
+        row["mr_pipelines_canceled"] = acc.mr_pipelines_canceled
+        row["mrs_merged_with_mr_pipeline"] = acc.mrs_merged_with_mr_pipeline
+        row["mr_pipeline_success_rate"] = (acc.mr_pipelines_success / acc.mr_pipelines_total) if acc.mr_pipelines_total else None
+        merged = row["mrs_merged"]
+        row["mr_pipeline_adoption_rate"] = (acc.mrs_merged_with_mr_pipeline / merged) if merged else None
+        row["mr_pipeline_duration_median_seconds"] = safe_median(acc.mr_pipeline_durations)
+        row["mr_pipeline_duration_mean_seconds"] = safe_mean(acc.mr_pipeline_durations)
+        row["mr_pipeline_coverage_mean"] = safe_mean(acc.mr_pipeline_coverages)
+
+    # ----------------------------
+    # Project snapshots + default-branch CI metrics per month
+    # ----------------------------
+    LOG.info("Computing monthly project snapshots + default-branch CI metrics...")
+    for idx, project in enumerate(projects, start=1):
+        pid = project.id
+        pname = getattr(project, "path_with_namespace", str(pid))
+        default_branch = getattr(project, "default_branch", "") or "main"
+        LOG.info("[%d/%d] Snapshot & default-branch pipelines for %s", idx, len(projects), pname)
+
+        # Pipelines on default branch (bucket by created_at)
+        pipelines = gl.pipelines_on_ref(project, default_branch, since)
+
+        dur_by_month: Dict[str, List[float]] = {m: [] for m in months}
+        cov_by_month: Dict[str, List[float]] = {m: [] for m in months}
+        status_by_month: Dict[str, Dict[str, int]] = {m: {"success": 0, "failed": 0, "canceled": 0, "other": 0} for m in months}
+        total_by_month: Dict[str, int] = {m: 0 for m in months}
+
+        for p in pipelines:
+            created = parse_dt(getattr(p, "created_at", None))
+            if not created or created < since or created > until:
+                continue
+            mk = month_key(created)
+            if mk not in total_by_month:
+                continue
+
+            details = gl.pipeline_details(project, p.id)
+            status_bucket = pipeline_bucket_status(details.get("status"))
+            total_by_month[mk] += 1
+            status_by_month[mk][status_bucket] += 1
+
+            d = details.get("duration")
+            if isinstance(d, (int, float)):
+                dur_by_month[mk].append(float(d))
+
+            cov = details.get("coverage")
+            try:
+                if cov is not None:
+                    cov_by_month[mk].append(float(cov))
+            except Exception:
+                pass
+
+        for mk in months:
+            row = project_rows[(pid, mk)]
+            row["default_branch_pipelines_total"] = total_by_month[mk]
+            row["default_branch_pipelines_success"] = status_by_month[mk]["success"]
+            row["default_branch_pipelines_failed"] = status_by_month[mk]["failed"]
+            row["default_branch_pipelines_canceled"] = status_by_month[mk]["canceled"]
+
+            total = total_by_month[mk]
+            row["default_branch_pipeline_success_rate"] = (status_by_month[mk]["success"] / total) if total else None
+            row["default_branch_pipeline_duration_median_seconds"] = safe_median(dur_by_month[mk])
+            row["default_branch_pipeline_duration_mean_seconds"] = safe_mean(dur_by_month[mk])
+            row["default_branch_pipeline_coverage_median"] = safe_median(cov_by_month[mk])
+            row["default_branch_pipeline_coverage_mean"] = safe_mean(cov_by_month[mk])
+
+        # Repo snapshots per month (end-of-month sha)
+        for (mk, _mstart, mend) in month_windows:
+            sha = gl.latest_sha_before(project, default_branch, mend)
+            if not sha:
+                continue
+            try:
+                tar_bytes = gl.repo_archive(pid, sha)
+                LOG.debug("Archive %s %s: type=%s size=%s", pname, mk, type(tar_bytes), len(tar_bytes))
+
+                if not looks_like_gzip(tar_bytes):
+                    # Often indicates an HTML error page from GitLab/proxy
+                    LOG.warning(
+                        "Snapshot failed for %s %s: archive is not gzip; head=%r",
+                        pname, mk, head_preview(tar_bytes)
+                    )
                     continue
 
-            snap.latest_pipeline_coverage = round(latest_cov, 2) if latest_cov is not None else None
+                st = scan_snapshot(tar_bytes, forge_prefixes)
 
-            row = {"project_id": pid, "project_path": ppath, "ref": default_branch, **asdict(snap)}
-            snapshot_rows.append(row)
+                row = project_rows[(pid, mk)]
+                row["snapshot_ok"] = 1
+                row["has_ci_config"] = st.has_ci_config
+                row["has_configs"] = st.has_configs
+                row["has_docs"] = st.has_docs
+                row["has_notebooks_dir"] = st.has_notebooks_dir
+                row["has_src"] = st.has_src
+                row["has_tests"] = st.has_tests
+                row["has_tests_integration"] = st.has_tests_integration
+                row["has_scripts_dir"] = st.has_scripts_dir
+                row["has_requirements_file"] = st.has_requirements_file
 
-            workspace_agg["n_projects"] += 1
-            workspace_agg["has_configs_sum"] += snap.has_configs
-            workspace_agg["has_docs_sum"] += snap.has_docs
-            workspace_agg["has_notebooks_sum"] += snap.has_notebooks
-            workspace_agg["has_requirements_sum"] += snap.has_requirements
-            workspace_agg["has_src_sum"] += snap.has_src
-            workspace_agg["has_tests_sum"] += snap.has_tests
-            workspace_agg["has_tests_integration_sum"] += snap.has_tests_integration
-            workspace_agg["volume_functions_sum"] += snap.volume_functions
-            workspace_agg["volume_functions_with_docstrings_sum"] += snap.volume_functions_with_docstrings
-            workspace_agg["volume_function_calls_sum"] += snap.volume_function_calls
-            workspace_agg["volume_function_forge_calls_sum"] += snap.volume_function_forge_calls
-            workspace_agg["volume_notebooks_sum"] += snap.volume_notebooks
-            workspace_agg["volume_scripts_sum"] += snap.volume_scripts
-
-        except Exception as e:
-            LOGGER.exception("Snapshot analysis failed for %s: %s", ppath, e)
-
-    # derive workspace percentages
-    wf = workspace_agg["volume_functions_sum"]
-    wfd = workspace_agg["volume_functions_with_docstrings_sum"]
-    wcalls = workspace_agg["volume_function_calls_sum"]
-    wff = workspace_agg["volume_function_forge_calls_sum"]
-    wnb = workspace_agg["volume_notebooks_sum"]
-    wsc = workspace_agg["volume_scripts_sum"]
-
-    workspace_snapshot = {
-        "n_projects": int(workspace_agg["n_projects"]),
-        "folder_presence_rate_configs_pct": round(100.0 * workspace_agg["has_configs_sum"] / max(1, workspace_agg["n_projects"]), 2),
-        "folder_presence_rate_docs_pct": round(100.0 * workspace_agg["has_docs_sum"] / max(1, workspace_agg["n_projects"]), 2),
-        "folder_presence_rate_notebooks_pct": round(100.0 * workspace_agg["has_notebooks_sum"] / max(1, workspace_agg["n_projects"]), 2),
-        "folder_presence_rate_requirements_pct": round(100.0 * workspace_agg["has_requirements_sum"] / max(1, workspace_agg["n_projects"]), 2),
-        "folder_presence_rate_src_pct": round(100.0 * workspace_agg["has_src_sum"] / max(1, workspace_agg["n_projects"]), 2),
-        "folder_presence_rate_tests_pct": round(100.0 * workspace_agg["has_tests_sum"] / max(1, workspace_agg["n_projects"]), 2),
-        "folder_presence_rate_tests_integration_pct": round(100.0 * workspace_agg["has_tests_integration_sum"] / max(1, workspace_agg["n_projects"]), 2),
-        "volume_functions": int(wf),
-        "pct_functions_with_docstrings": round(100.0 * wfd / wf, 2) if wf else 0.0,
-        "volume_function_calls": int(wcalls),
-        "pct_function_forge_calls": round(100.0 * wff / wcalls, 2) if wcalls else 0.0,
-        "volume_notebooks": int(wnb),
-        "volume_scripts": int(wsc),
-        "pct_scripts_over_notebooks_plus_scripts": round(100.0 * wsc / (wnb + wsc), 2) if (wnb + wsc) else 0.0,
-    }
-
-    write_csv(os.path.join(outdir, "current_project_snapshot.csv"), snapshot_rows)
-    write_json(os.path.join(outdir, "current_workspace_snapshot.json"), workspace_snapshot)
-
-    # -----------------------------
-    # 2) Monthly metrics (last quarter / last N full months)
-    # -----------------------------
-    windows = month_windows_last_full_months(args.months)
-    monthly_project_rows: List[Dict[str, Any]] = []
-    monthly_workspace_rows: List[Dict[str, Any]] = []
-    monthly_user_rows: List[Dict[str, Any]] = []
-
-    LOGGER.info("Computing MONTHLY metrics for %d months (last full months)", len(windows))
-
-    for (m_start, m_end) in windows:
-        LOGGER.info("Month window: %s -> %s", m_start, m_end)
-        start_iso, end_iso = iso_datetime_range(m_start, m_end)
-
-        # per-month workspace aggregation
-        ws_pipelines = 0
-        ws_mrs = 0
-        ws_time_to_merge: List[float] = []
-        ws_mr_commits: List[float] = []
-        ws_covs: List[float] = []
-
-        ws_net_notebooks = 0
-        ws_net_scripts = 0
-        ws_net_docstrings = 0
-        ws_net_tests = 0
-        ws_net_ff = 0
-
-        # user aggregation bucket for this month across all projects
-        user_bucket_month: Dict[int, MonthlyUserMetrics] = {}
-
-        # project loop
-        for proj in projects:
-            try:
-                p_metrics, p_user_bucket = project_monthly_metrics(gl, proj, m_start, m_end)
-                monthly_project_rows.append(asdict(p_metrics))
-
-                ws_pipelines += p_metrics.pipelines_count
-                ws_mrs += p_metrics.merged_mrs_count
-                if p_metrics.avg_pipeline_coverage is not None:
-                    ws_covs.append(float(p_metrics.avg_pipeline_coverage))
-                if p_metrics.avg_time_to_merge_hours is not None:
-                    ws_time_to_merge.append(float(p_metrics.avg_time_to_merge_hours))
-                if p_metrics.avg_mr_commits is not None:
-                    ws_mr_commits.append(float(p_metrics.avg_mr_commits))
-
-                ws_net_notebooks += p_metrics.net_notebooks
-                ws_net_scripts += p_metrics.net_scripts
-                ws_net_docstrings += p_metrics.net_docstring_additions
-                ws_net_tests += p_metrics.net_tests_files_added
-                ws_net_ff += p_metrics.net_function_forge_imports_added
-
-                # merge per-project user buckets into month bucket
-                for uid, um in p_user_bucket.items():
-                    if uid not in user_bucket_month:
-                        user_bucket_month[uid] = um
-                    else:
-                        user_bucket_month[uid].mrs_authored_count += um.mrs_authored_count
-                        user_bucket_month[uid].comments_count += um.comments_count
-                        user_bucket_month[uid].notebooks_reduced += um.notebooks_reduced
-                        user_bucket_month[uid].docstrings_added += um.docstrings_added
-                        user_bucket_month[uid].tests_added += um.tests_added
-                        user_bucket_month[uid].function_forge_added += um.function_forge_added
+                row["functions_total"] = st.functions_total
+                row["functions_with_docstring"] = st.functions_with_docstring
+                row["docstring_coverage_pct"] = st.docstring_coverage_pct
+                row["forge_import_symbols_pct"] = st.forge_import_symbols_pct
+                row["notebooks_count"] = st.notebooks_count
+                row["scripts_count"] = st.scripts_count
+                row["notebook_ratio"] = st.notebook_ratio
 
             except Exception as e:
-                LOGGER.exception("Monthly metrics failed for project %s: %s", proj.get("path_with_namespace"), e)
+                LOG.warning("Snapshot failed for %s %s: %s", pname, mk, str(e))
 
-        # fill commit counts for users (best-effort)
-        fill_user_commit_counts(gl, projects, user_bucket_month, start_iso, end_iso)
+    # ----------------------------
+    # Workspace aggregation (namespace-level)
+    # ----------------------------
+    LOG.info("Aggregating workspace-level (namespace) metrics...")
+    df_proj = pd.DataFrame(list(project_rows.values()))
+    df_user = pd.DataFrame(list(user_rows.values()))
 
-        # write month’s user rows
-        for uid, um in user_bucket_month.items():
-            monthly_user_rows.append(asdict(um))
+    folder_cols = [
+        "has_ci_config", "has_configs", "has_docs", "has_notebooks_dir", "has_src", "has_tests",
+        "has_tests_integration", "has_scripts_dir", "has_requirements_file",
+    ]
 
-        # workspace month row
-        ws_row = {
-            "month_start": str(m_start),
-            "month_end": str(m_end),
-            "pipelines_count": ws_pipelines,
-            "avg_pipeline_coverage": round(safe_mean(ws_covs), 2) if ws_covs else None,
-            "merged_mrs_count": ws_mrs,
-            "avg_time_to_merge_hours": round(safe_mean(ws_time_to_merge), 2) if ws_time_to_merge else None,
-            "avg_mr_commits": round(safe_mean(ws_mr_commits), 2) if ws_mr_commits else None,
-            "net_notebooks": ws_net_notebooks,
-            "net_scripts": ws_net_scripts,
-            "net_docstring_additions": ws_net_docstrings,
-            "net_tests_files_added": ws_net_tests,
-            "net_function_forge_imports_added": ws_net_ff,
-        }
-        monthly_workspace_rows.append(ws_row)
+    workspace = df_proj.groupby("month", as_index=False).agg({
+        "project_id": "count",
+        "snapshot_ok": "sum",
+        "docstring_coverage_pct": "mean",
+        "forge_import_symbols_pct": "mean",
+        "notebooks_count": "sum",
+        "scripts_count": "sum",
+        "notebook_ratio": "mean",
 
-    write_csv(os.path.join(outdir, "monthly_project_metrics.csv"), monthly_project_rows)
-    write_csv(os.path.join(outdir, "monthly_workspace_metrics.csv"), monthly_workspace_rows)
-    write_csv(os.path.join(outdir, "monthly_user_metrics.csv"), monthly_user_rows)
+        "mrs_created": "sum",
+        "mrs_merged": "sum",
+        "mr_notes_total": "sum",
 
-    # -----------------------------
-    # 3) Summary JSON
-    # -----------------------------
-    summary = {
-        "generated_at": dt.datetime.utcnow().isoformat() + "Z",
-        "base_url": args.base_url,
-        "group_id": args.group_id,
-        "n_projects": len(projects),
-        "months": args.months,
-        "outputs": {
-            "current_project_snapshot": "current_project_snapshot.csv",
-            "current_workspace_snapshot": "current_workspace_snapshot.json",
-            "monthly_project_metrics": "monthly_project_metrics.csv",
-            "monthly_workspace_metrics": "monthly_workspace_metrics.csv",
-            "monthly_user_metrics": "monthly_user_metrics.csv",
-        },
-        "workspace_snapshot": workspace_snapshot,
-    }
-    write_json(os.path.join(outdir, "summary.json"), summary)
+        "mrs_closed": "sum",
+        "mr_time_to_close_hours_median": "mean",
+        "mr_time_to_close_hours_mean": "mean",
 
-    LOGGER.info("Done. Outputs in: %s", os.path.abspath(outdir))
+        "default_branch_pipelines_total": "sum",
+        "default_branch_pipelines_success": "sum",
+        "default_branch_pipelines_failed": "sum",
+        "default_branch_pipelines_canceled": "sum",
+        "default_branch_pipeline_duration_median_seconds": "mean",
+        "default_branch_pipeline_duration_mean_seconds": "mean",
+        "default_branch_pipeline_coverage_median": "mean",
+        "default_branch_pipeline_coverage_mean": "mean",
+
+        "mr_pipelines_total": "sum",
+        "mr_pipelines_success": "sum",
+        "mr_pipelines_failed": "sum",
+        "mr_pipelines_canceled": "sum",
+        "mrs_merged_with_mr_pipeline": "sum",
+        "mr_pipeline_duration_median_seconds": "mean",
+        "mr_pipeline_duration_mean_seconds": "mean",
+        "mr_pipeline_coverage_median": "mean",
+        "mr_pipeline_coverage_mean": "mean",
+
+        "mr_added_docstring_lines": "sum",
+        "mr_test_files_touched": "sum",
+        "mr_test_lines_added": "sum",
+        "mr_notebooks_net_files": "sum",
+    }).rename(columns={"project_id": "projects_count"})
+
+    def _ws_ratio(row):
+        denom = (row["notebooks_count"] + row["scripts_count"])
+        return (row["notebooks_count"] / denom) if denom and denom > 0 else None
+
+    workspace["workspace_notebook_ratio"] = workspace.apply(_ws_ratio, axis=1)
+
+    workspace["workspace_default_branch_pipeline_success_rate"] = workspace.apply(
+        lambda r: (r["default_branch_pipelines_success"] / r["default_branch_pipelines_total"])
+        if r["default_branch_pipelines_total"] else None,
+        axis=1,
+    )
+    workspace["workspace_mr_pipeline_success_rate"] = workspace.apply(
+        lambda r: (r["mr_pipelines_success"] / r["mr_pipelines_total"])
+        if r["mr_pipelines_total"] else None,
+        axis=1,
+    )
+    workspace["workspace_mr_pipeline_adoption_rate"] = workspace.apply(
+        lambda r: (r["mrs_merged_with_mr_pipeline"] / r["mrs_merged"])
+        if r["mrs_merged"] else None,
+        axis=1,
+    )
+
+    # folder adoption %
+    for c in folder_cols:
+        workspace[f"pct_projects_{c}"] = 100.0 * df_proj.groupby("month")[c].mean().values
+
+    # ----------------------------
+    # Write CSVs
+    # ----------------------------
+    os.makedirs(args.outdir, exist_ok=True)
+
+    proj_path = os.path.join(args.outdir, "project_monthly.csv")
+    user_path = os.path.join(args.outdir, "user_monthly.csv")
+    ws_path = os.path.join(args.outdir, "workspace_monthly.csv")
+
+    df_proj.sort_values(["month", "project"]).to_csv(proj_path, index=False)
+    df_user.sort_values(["month", "username"]).to_csv(user_path, index=False)
+    workspace.sort_values(["month"]).to_csv(ws_path, index=False)
+
+    LOG.info("Wrote: %s", proj_path)
+    LOG.info("Wrote: %s", user_path)
+    LOG.info("Wrote: %s", ws_path)
+    LOG.info("Done.")
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())
