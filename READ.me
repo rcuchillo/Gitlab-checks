@@ -45,3 +45,21 @@ python gitlab_mlops_adoption.py \
   --function-forge-names function_forge,function-forge \
   --outdir ./out \
   --log-level INFO
+
+
+
+EXCLUDE_PREFIXES_FOR_COUNTS = (
+    ".venv/", "venv/", "env/",
+    "site-packages/",
+    "dist/", "build/",
+    "__pycache__/",
+)
+
+def is_excluded(norm: str) -> bool:
+    return any(norm.startswith(p) for p in EXCLUDE_PREFIXES_FOR_COUNTS)
+
+# then:
+if norm.endswith(".ipynb") and not is_excluded(norm):
+    st.notebooks_count += 1
+if norm.endswith(".py") and not is_excluded(norm):
+    st.scripts_count += 1
