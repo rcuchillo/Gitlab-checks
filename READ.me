@@ -49,6 +49,56 @@ python gitlab_mlops_adoption.py \
 
 
 
-# Ensure counts are numeric (otherwise groupby sum can be wrong)
-df_proj["notebooks_count"] = pd.to_numeric(df_proj["notebooks_count"], errors="coerce").fillna(0).astype(int)
-df_proj["scripts_count"]   = pd.to_numeric(df_proj["scripts_count"], errors="coerce").fillna(0).astype(int)
+
+
+
+
+def extract_python_sources_from_archive(
+    tar_bytes: bytes,
+    include_prefixes: Optional[Tuple[str, ...]] = None,  # None = include all paths
+    exclude_prefixes: Tuple[str, ...] = (
+        ".venv/", "venv/", "env/",
+        "site-packages/",
+        "dist/", "build/",
+        "__pycache__/",
+    ),
+    max_files: int = 8000,
+    max_file_bytes: int = 2_000_000,
+) -> Dict[str, str]:
+    py_sources: Dict[str, str] = {}
+    with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:gz") as tf:
+        for m in tf.getmembers():
+            if len(py_sources) >= max_files:
+                break
+            if not m.isfile():
+                continue
+            if not m.name.endswith(".py"):
+                continue
+            if m.size and m.size > max_file_bytes:
+                continue
+
+            norm = m.name.split("/", 1)[1] if "/" in m.name else m.name
+
+            if include_prefixes is not None and not any(norm.startswith(p) for p in include_prefixes):
+                continue
+            if exclude_prefixes and any(norm.startswith(p) for p in exclude_prefixes):
+                continue
+
+            f = tf.extractfile(m)
+            if not f:
+                continue
+            try:
+                src = f.read().decode("utf-8", errors="replace")
+            except Exception:
+                continue
+            py_sources[norm] = src
+    return py_sources
+
+
+
+
+
+
+
+
+py_sources = extract_python_sources_from_archive(tar_bytes, include_prefixes=None)
