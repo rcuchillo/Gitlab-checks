@@ -1,143 +1,89 @@
-Full list (original wording)
+You’re right to be cautious. **Screening** (sanctions/PEP/adverse media/name matching) and **transaction monitoring (TM)** share “case management,” but the *hard parts* are different. If SymphonyAI’s strongest published numbers are screening-led, here are the main limitations/risk areas when applying similar “98% agreement / 90% effort reduction” expectations to TM.
 
-Identify and remove manual steps across model development, validation, deployment and monitoring
+## Where screening results don’t translate cleanly to TM
 
-Leverage Copilot, prompt libraries and Copilot Studio to automate repeatable tasks (e.g., peer review support, drafting, checks)
+### 1) Ground truth is weaker in TM
 
-Apply clear standards for notebooks vs scripts (exploration vs repeatable execution)
+* **Screening** often has clearer adjudication outcomes (match / no match) and external reference lists.
+* **TM** is about *suspicion* and typology interpretation; SAR filing is a delayed/partial label and often inconsistent across investigators.
 
-Default to configuration-driven code (minimise hard-coding; validate configs)
+**Implication:** “Agreement” may drop or become less meaningful unless you define a robust reference standard (QA panel, typology rubric, outcome proxies).
 
-Use Jira consistently to log, prioritise and track delivery; escalate blockers early
+### 2) Much higher context and narrative complexity
 
-Document issues and resolutions systematically on Confluence (lightweight RCA + prevention actions)
+TM cases typically require:
 
-Contribute reusable assets to simplification initiatives (e.g. Function Forge)
+* multi-transaction patterns over time,
+* counterparty networks,
+* customer behaviour baselines,
+* product/channel context,
+* and rationale for why it breaches typology thresholds.
 
-Align capacity to the highest-value priorities on the model delivery roadmap
+**Implication:** Agents need stronger tooling (graph, aggregations, peer groups, sequence features). Without that, you can get fluent narratives that are incomplete or mis-specified.
 
-Deliver PoCs that directly support MTP submissions and demonstrate benefit realisation
+### 3) Tooling dependency is heavier
 
-Proactively surface opportunities for new PoCs by capturing stakeholder pain points
+To be credible in TM, an “agent” must reliably:
 
-Ensure timely delivery of model builds, refreshes, calibration and ad-hoc analysis
+* pull the right transaction subsets,
+* compute aggregates (velocity, round-tripping, cash intensity),
+* join KYC/EDD, account linkages, device/IP, merchant data,
+* and cite evidence.
 
-Create clear scope, acceptance criteria and outcomes for every piece of work
+**Implication:** Performance becomes **integration-limited**. If data access is slow/fragmented or calculations aren’t standardized, productivity gains shrink and variance increases.
 
-Drive MLOps adoption and modern development practices (Standard Environment, Gitlab Duo, MLflow, Airflow, PyTest, ...)
+### 4) Alert volumes and heterogeneity are bigger
 
-Ensure every model/pipeline is onboarded to CI with standard quality gates
+TM queues span many typologies (mules, structuring, laundering, scams, trade, crypto rails, etc.) and business lines. Screening workflows are often more uniform.
 
-Maintain common code patterns and shared libraries to reduce deviation risk (Function Forge)
+**Implication:** A single “% effort reduction” headline is unlikely to hold across typologies. You’ll see a wide spread: some typologies automate well; others don’t.
 
-Apply appropriate governance, testing, reproducibility and auditability standards end-to-end
+### 5) False positive reduction is not the same lever
 
-Strengthen operational discipline through thorough documentation and consistent tooling
+In screening, big gains come from discounting obvious non-matches at scale.
+In TM, big gains usually come from:
 
-Ensure all models are tested in line with ASDS standards with auditable evidence
+* better alert quality upstream (scenario tuning/modeling),
+* alert grouping/roll-up,
+* and better triage prioritisation.
 
-Contribute to study groups, working groups and knowledge-sharing sessions
+**Implication:** An “agent” alone may reduce *handling time*, but may not materially reduce *alert volume* unless combined with detection changes.
 
-Encourage constructive challenge of processes; propose concrete improvements
+### 6) Higher model risk / governance burden
 
-Explore automation and new modelling approaches through collaborative discussion
+TM decisions are typically more scrutinised: explainability, traceability, and consistency with internal policy and regulatory expectations.
 
-Support upskilling through open knowledge exchange and shared learning
+**Implication:** You’ll need stronger controls:
 
-Recognise and scale good ideas across locations (UK / US / India)
+* evidence citations for every claim,
+* “abstain/escalate” rules,
+* QA sampling,
+* and audit logs of every tool call and source.
 
-Build strong, trusted stakeholder relationships and clear engagement rhythms
+### 7) Higher hallucination risk impact
 
-Respond promptly and transparently; escalate blockers early and visibly
+If a screening agent hallucinates, it’s often caught by match logic or list checks.
+If a TM narrative hallucinates transactions/relationships, it can create **unsupported suspicion** or **miss key suspicion**.
 
-Provide clear, high-quality analysis and recommendations with explicit assumptions
+**Implication:** You need hard guardrails: retrieval-only generation, transaction IDs in output, and automatic cross-checks (e.g., “every amount/date in narrative must map to a transaction record”).
 
-Ensure outputs (models, analyses, dashboards, documentation) meet a consistent service standard
+### 8) Investigator workflow differs
 
-Close the loop: confirm outcomes, benefits, and next actions after delivery
+Screening often has short, repetitive steps; TM investigations can involve RFIs, customer contact outcomes, and multi-stage approvals.
 
-Improve first draft quality
-
-
+**Implication:** “Manual effort” in TM is not just review time; it includes waiting, coordination, and documentation—so the measurable uplift may be smaller unless you automate the full chain.
 
 ---
 
-Categorised into meaningful objectives (same wording preserved)
+## How to frame a TM pilot so you don’t get misled by screening-style metrics
 
-1) Simplification and automation
+Instead of asking for “90% effort reduction,” measure by TM-relevant KPIs:
 
-Identify and remove manual steps across model development, validation, deployment and monitoring
+* **AHT per alert** by typology (median + distribution)
+* **% cases closed at L1 vs escalated** (and *why*)
+* **QA defect rate** (missing evidence, wrong typology mapping, unsupported statements)
+* **Narrative edit time** (minutes saved, not just “quality”)
+* **Evidence traceability rate** (% narrative claims with linked transactions/KYC sources)
+* **Abstention/escalation rate** (healthy guardrail behaviour)
 
-Leverage Copilot, prompt libraries and Copilot Studio to automate repeatable tasks (e.g., peer review support, drafting, checks)
-
-Encourage constructive challenge of processes; propose concrete improvements
-
-Explore automation and new modelling approaches through collaborative discussion
-
-Contribute reusable assets to simplification initiatives (e.g. Function Forge)
-
-
-2) Engineering standards and reusability
-
-Apply clear standards for notebooks vs scripts (exploration vs repeatable execution)
-
-Default to configuration-driven code (minimise hard-coding; validate configs)
-
-Maintain common code patterns and shared libraries to reduce deviation risk (Function Forge)
-
-
-3) Delivery planning and execution discipline
-
-Align capacity to the highest-value priorities on the model delivery roadmap
-
-Ensure timely delivery of model builds, refreshes, calibration and ad-hoc analysis
-
-Create clear scope, acceptance criteria and outcomes for every piece of work
-
-Use Jira consistently to log, prioritise and track delivery; escalate blockers early
-
-Close the loop: confirm outcomes, benefits, and next actions after delivery
-
-Improve first draft quality
-
-
-4) Controls, governance, testing and auditability
-
-Drive MLOps adoption and modern development practices (Standard Environment, Gitlab Duo, MLflow, Airflow, PyTest, ...)
-
-Ensure every model/pipeline is onboarded to CI with standard quality gates
-
-Apply appropriate governance, testing, reproducibility and auditability standards end-to-end
-
-Ensure all models are tested in line with ASDS standards with auditable evidence
-
-Strengthen operational discipline through thorough documentation and consistent tooling
-
-Document issues and resolutions systematically on Confluence (lightweight RCA + prevention actions)
-
-
-5) PoCs and benefit realisation
-
-Deliver PoCs that directly support MTP submissions and demonstrate benefit realisation
-
-Proactively surface opportunities for new PoCs by capturing stakeholder pain points
-
-
-6) Stakeholder service excellence
-
-Build strong, trusted stakeholder relationships and clear engagement rhythms
-
-Respond promptly and transparently; escalate blockers early and visibly
-
-Provide clear, high-quality analysis and recommendations with explicit assumptions
-
-Ensure outputs (models, analyses, dashboards, documentation) meet a consistent service standard
-
-
-7) Learning, knowledge-sharing and scaling across locations
-
-Contribute to study groups, working groups and knowledge-sharing sessions
-
-Support upskilling through open knowledge exchange and shared learning
-
-Recognise and scale good ideas across locations (UK / US / India)
+If you want, I can translate this into a **TM-specific pilot scorecard** with “what good looks like” thresholds (e.g., minimum traceability, maximum defect rate, target AHT reduction) so you can compare vendors fairly and avoid over-indexing on screening numbers.
