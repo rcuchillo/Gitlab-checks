@@ -1,104 +1,41 @@
-9export GITLAB_URL="https://gitlab.yourcompany.com"
-export GITLAB_TOKEN="YOUR_PRIVATE_TOKEN"
+What’s not working today
 
+Calls don’t lead to decisions. Feedback is high-level and doesn’t turn into clear requirements.
 
-python gitlab_mlops_metrics.py \
-  --group "your-group/path" \
-  --since "2025-10-01T00:00:00Z" \
-  --until "2026-01-01T00:00:00Z" \
-  --outdir "./out" \
-  --recursive-repo-scan
+Actions fall through the cracks. Owners aren’t always clear, tracking is messy, and things get marked “done” without proof.
 
+Too many people in every loop. Risk owners / NOMO are being pulled into routine iterations, which slows everyone down.
 
-gitlab_adoption_metrics.py
+Too many hand-offs. ML, Central Service, and Control Owners rely on each other in ways that create waiting and rework.
 
-python gitlab_adoption_metrics.py \
-  --group "your-group/path" \
-  --since "2026-01-01T00:00:00Z" \
-  --until "2026-12-31T23:59:59Z" \
-  --outdir "./out" \
-  --forge-prefixes "function_forge" \
-  --src-prefixes "src" \
-  --snapshot-every-month
-
-gitlab_mlops_adoption.py
-
-pip install python-gitlab pandas python-dateutil
-export GITLAB_URL="https://gitlab.yourcompany.com"
-export GITLAB_TOKEN="YOUR_ACCESS_TOKEN"
-
-python gitlab_mlops_adoption.py \
-  --group "your-group/path" \
-  --since "2026-01-01T00:00:00Z" \
-  --until "2026-12-31T23:59:59Z" \
-  --outdir "./out" \
-  --forge-prefixes "function_forge" \
-  --log-level INFO
-
-gitlab-tracker
-
-export GITLAB_TOKEN="..."
-python gitlab_mlops_adoption.py \
-  --base-url https://gitlab.example.com \
-  --token "$GITLAB_TOKEN" \
-  --group-id 12345 \
-  --function-forge-names function_forge,function-forge \
-  --outdir ./out \
-  --log-level INFO
+We already know the “can’t miss” SARs, but they’re not being used as a consistent test / safety baseline each iteration.
 
 
 
+---
+
+What to change (simple operating model tweaks)
+
+One place to capture feedback. Control Owners collect input and turn it into clear requirements + what “good” looks like before it comes back to ML / Central Service.
+
+Right people, right meetings.
+
+Weekly working session: ML + Central Service + Control Owners → make decisions and move delivery on.
+
+Monthly checkpoint: bring in risk owners / compliance only for material topics.
+
+Release gate: formal sign-off with an evidence pack.
 
 
+Tighter action tracking. One action log, one owner per action, due date, and a link to evidence before it’s closed.
+
+Clear hand-offs between teams.
+
+ML brings model results, limits, and scenario coverage.
+
+Central Service brings guardrails, monitoring, and runbooks.
+
+Control Owners bring prioritised asks and acceptance criteria.
 
 
-
-def extract_python_sources_from_archive(
-    tar_bytes: bytes,
-    include_prefixes: Optional[Tuple[str, ...]] = None,  # None = include all paths
-    exclude_prefixes: Tuple[str, ...] = (
-        ".venv/", "venv/", "env/",
-        "site-packages/",
-        "dist/", "build/",
-        "__pycache__/",
-    ),
-    max_files: int = 8000,
-    max_file_bytes: int = 2_000_000,
-) -> Dict[str, str]:
-    py_sources: Dict[str, str] = {}
-    with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:gz") as tf:
-        for m in tf.getmembers():
-            if len(py_sources) >= max_files:
-                break
-            if not m.isfile():
-                continue
-            if not m.name.endswith(".py"):
-                continue
-            if m.size and m.size > max_file_bytes:
-                continue
-
-            norm = m.name.split("/", 1)[1] if "/" in m.name else m.name
-
-            if include_prefixes is not None and not any(norm.startswith(p) for p in include_prefixes):
-                continue
-            if exclude_prefixes and any(norm.startswith(p) for p in exclude_prefixes):
-                continue
-
-            f = tf.extractfile(m)
-            if not f:
-                continue
-            try:
-                src = f.read().decode("utf-8", errors="replace")
-            except Exception:
-                continue
-            py_sources[norm] = src
-    return py_sources
-
-
-
-
-
-
-
-
-py_sources = extract_python_sources_from_archive(tar_bytes, include_prefixes=None)
+Make “must-not-miss” real. Agree a short list of critical SAR patterns and run a non-regression check every release (or document the guardrail/mitigation).
