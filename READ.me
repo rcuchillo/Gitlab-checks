@@ -1,9 +1,134 @@
-Honest take on the SAI proposals — I don't think we should progress either track right now.
+Build a web application called "Org Designer" that runs in the browser and helps team leads design organisational structures that meet span-of-control targets within budget constraints.
 
-The Agentic Investigations piece would need real tech support and team time to land, and with the pilot going well I don't want to take on anything that risks knocking that. The business case just isn't there for us at the moment.
+---
 
-AML Detection was the more interesting one, but the demo was underwhelming — threats were pretty basic and generic. Feels like it's still early-stage and we'd essentially be doing their validation work for them.
+## Tech Stack
 
-One thing we haven't explored is APAC. We can't cover that internally and they might be a decent fit there — worth a separate conversation if you think it's worth pursuing.
+- React (Vite) frontend, no backend required
+- All data lives client-side
+- File I/O via browser download/upload (JSON)
+- Styling: Tailwind CSS
+- Org tree visualisation: use D3.js or react-d3-tree
 
-Happy to chat through before you respond to Rob
+---
+
+## Data Inputs
+
+The app loads an Excel spreadsheet (.xlsx) with two tabs:
+
+**Tab 1 — Role Reference Data**
+Columns: Role (e.g. AVP, VP, Director, MD), Location, Rate (annual cost)
+This is the catalogue of available roles and their costs by location.
+
+**Tab 2 — Current Team Structure**
+Columns: ColleagueID, Grade, Location, ActualRate, LineManagerID
+LineManagerID references another ColleagueID in the same tab.
+A blank or null LineManagerID means that person is the root (top of the hierarchy).
+
+Parse both tabs on file load using SheetJS (xlsx library from CDN).
+
+---
+
+## Core Features
+
+### 1. Dashboard / Summary Bar (always visible at top)
+Show at a glance:
+- Total headcount
+- Total cost vs Budget (input field for budget, shown as £X of £Y, with a green/amber/red indicator)
+- Minimum span of control (fewest direct reports any manager has, excluding leaf nodes)
+- Average span of control across all managers
+- Target thresholds displayed: min span ≥ 4, average span ≥ 8
+- Highlight metrics in red if below target, green if met
+
+### 2. Org Tree View
+- Interactive collapsible/expandable hierarchy tree
+- Each node shows: ColleagueID, Grade, Location, Rate
+- Colour-code nodes by grade
+- Clicking a node opens a sidebar panel with full details and action buttons
+
+### 3. Team Table View
+- Tabular view of all positions with columns: ColleagueID, Grade, Location, Rate, LineManagerID, Direct Reports count
+- Sortable columns
+- Each row has action buttons: Edit, Move, Delete
+
+### 4. Toggle between Tree View and Table View (tab switcher, both always in sync)
+
+---
+
+## Editing Operations
+
+All edits update the in-memory data model and instantly refresh both views and the summary bar.
+
+**Delete position**
+- Remove a node from the hierarchy
+- If the deleted node has direct reports, prompt the user: reassign reports to the deleted node's manager (promote up), or leave them temporarily unmanaged (flag as orphans in red)
+
+**Create position**
+- Form to add a new position: pick Grade + Location from the role reference data (auto-fills rate from Tab 1), assign a LineManagerID, auto-generate a ColleagueID
+- New node immediately appears in tree and table
+
+**Move position**
+- Change the LineManagerID of any node to re-parent it in the hierarchy
+- Drag-and-drop in the tree view, or dropdown selector in the table view
+
+---
+
+## Save / Load
+
+**Save Design**
+- Button: "Save Design"
+- Downloads a JSON file containing: the current team structure (all positions with edits), the budget value, and a timestamp
+- Filename format: org-design-YYYY-MM-DD.json
+
+**Load Design**
+- Button: "Load Design"
+- Upload a previously saved JSON file to restore a session exactly as it was left
+
+**Load Source Data**
+- Separate button: "Load Spreadsheet"
+- Uploads the .xlsx source file to (re)initialise the base data
+
+---
+
+## UX Requirements
+
+- Clean, professional UI suitable for a financial services context
+- Responsive layout but optimised for desktop (1280px+)
+- Unsaved changes indicator in the header ("Unsaved changes" badge)
+- Confirmation dialogs before destructive actions (delete)
+- Orphaned nodes (no valid manager assigned) flagged visually in both views
+- Budget input persists in the saved JSON
+
+---
+
+## Constraints & Assumptions
+
+- No login, no backend, no database — everything runs in the browser
+- The app must work offline once loaded
+- The root node (top of hierarchy) has no LineManagerID
+- Span of control calculated only for nodes that have at least one direct report
+- Minimum span = lowest direct report count among all managers
+- Average span = total direct reports across all managers / number of managers
+- Rates are annual figures in GBP (£)
+
+---
+
+## Suggested File Structure
+
+/org-designer
+  /src
+    /components
+      DashboardBar.jsx
+      TreeView.jsx
+      TableView.jsx
+      NodeSidebar.jsx
+      EditForms.jsx
+    /utils
+      parseSpreadsheet.js
+      spanCalculations.js
+      fileIO.js
+    App.jsx
+    main.jsx
+  index.html
+  vite.config.js
+  package.json
