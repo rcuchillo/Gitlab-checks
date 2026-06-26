@@ -1,29 +1,23 @@
-You could keep it balanced and constructive without forcing criticism where none really exists:
+I think it's worth framing this as a question rather than a challenge. The goal is to ensure you're selecting the model that best delivers the business outcome—detecting the most SARs within operational capacity.
 
-What has gone well
+Hi all,
 
-We have developed a strong partnership and a positive working relationship over the past period.
+Thanks for pulling this analysis together. I agree that feature coverage is an important consideration and, if both models genuinely deliver equivalent detection performance, then selecting the model with broader coverage is a sensible approach.
 
-Communication between our teams has been open, transparent, and collaborative.
+One question I have is around the performance metrics used to conclude that the models are equivalent.
 
-There is a good level of trust, which allows us to have honest conversations and work through challenges constructively.
+Given the intended use case, this is fundamentally a ranking problem rather than a general classification problem. Operations only reviews the highest-scoring customers, so our objective is to maximise SAR detection within a fixed review capacity rather than optimise performance across the full score distribution.
 
-The teams work well together and remain focused on achieving shared outcomes.
+With that in mind, I'm not convinced that PRAUC alone is the most appropriate metric for model selection. Two models can have near-identical PRAUC while exhibiting materially different performance in the extreme right-hand tail of the distribution, which is precisely where the model will be operationalised.
 
-I appreciate the responsiveness and willingness to engage when issues arise or decisions need to be made.
+Would it be possible to compare the models using business-aligned ranking metrics, for example:
 
+- SAR capture (Recall) within the top N customers reviewed (or at the expected operational capacity).
+- Precision@K (SAR conversion rate within the review population).
+- Lift or cumulative gain in the highest score bands.
 
-What could be even better
+If these metrics demonstrate that detection is genuinely equivalent, then I would fully support using feature coverage as the deciding factor. However, if one model consistently identifies more SARs within the operational review population, I believe that should take precedence over broader feature coverage, as it is more closely aligned to the model's business objective.
 
-Overall, I do not have any major concerns or specific areas requiring significant improvement.
+It would be good to validate this before we finalise the decision.
 
-As our collaboration continues to grow, we could look for opportunities to involve each other earlier in strategic discussions and planning activities to ensure alignment from the outset.
-
-Continuing to simplify decision-making and maintaining clarity on priorities will help both teams remain focused on the highest-value activities.
-
-Regularly reviewing our joint objectives and success measures could help ensure we continue to deliver effectively as priorities evolve.
-
-
-Overall comment
-
-> I am very happy with how the partnership is working today. We have built a strong and collaborative relationship, and I value the open and constructive dialogue between our teams. While there are always opportunities to refine how we work together, I believe the foundations are very strong and the collaboration is delivering positive outcomes.
+Thanks,This version is executive in tone while making a strong technical point without implying that the current analysis is wrong. It invites the team to provide evidence using metrics that are directly aligned with the operational objective.
